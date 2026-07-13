@@ -18,7 +18,11 @@ from kubecore.authoring import pipeline, step  # platform-owned, do not edit
 
 HERE = Path(__file__).parent
 
-with pipeline("yolo-training-pipeline") as p:
+# The name you pass here is for local readability only — the platform RENAMES
+# the released WorkflowTemplate to "{your-app}-pipeline" at CI render time, so
+# each KubeApp gets its own uniquely-named WFT (no collisions across apps in a
+# shared namespace). You don't need to change it per app.
+with pipeline("ml-pipeline") as p:
     load = step("dataset-loading", reads=["data"],
                 outputs=["data-yaml", "manifest-summary"])
     train = step("model-training", gpu=True, needs=[load],

@@ -141,7 +141,7 @@ complete step list from this repo:
 ```python
 from kubecore.authoring import pipeline, step  # platform-owned, do not edit
 
-with pipeline("yolo-training-pipeline") as p:
+with pipeline("ml-pipeline") as p:  # platform renames to {app}-pipeline at release
     load = step("dataset-loading", reads=["data"],
                 outputs=["data-yaml", "manifest-summary"])
     train = step("model-training", gpu=True, needs=[load],
@@ -416,7 +416,7 @@ Open the workflow template in the Argo UI, press **Submit**:
   submissions:
 
   ```bash
-  argo submit --from workflowtemplate/yolo-training-pipeline \
+  argo submit --from workflowtemplate/{app}-pipeline \
       -p config="$(cat my-sweep-point.yaml)"
   ```
 

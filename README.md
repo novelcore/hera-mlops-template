@@ -17,7 +17,7 @@ the same YOLO training pipeline that used to be a **1551-line `kubeline.yaml`**.
 # pipeline.py — the ENTIRE pipeline definition
 from kubecore.authoring import pipeline, step
 
-with pipeline("yolo-training-pipeline") as p:
+with pipeline("ml-pipeline") as p:  # platform renames to {app}-pipeline at release
     load = step("dataset-loading", reads=["data"],
                 outputs=["data-yaml", "manifest-summary"])
     train = step("model-training", gpu=True, needs=[load],
