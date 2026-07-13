@@ -76,6 +76,25 @@ def test_reads_gate_fires_on_missing_section():
         assert "nonexistent-section" in str(e) and "badstep" in str(e)
 
 
+def test_reads_gate_catches_schema_backed_key_rename():
+    """A schema-backed section (data/quantization) whose YAML key is renamed
+    still appears in the composed tree (schema backfill) — the gate must catch
+    that via the on-disk source check, else the rename silently drops values."""
+    # 'data' is schema-backed and present in the tree, but simulate its config
+    # source being absent (renamed key) by asserting the source-check logic.
+    assert "data" in derive_tree.SCHEMA_BACKED
+    assert derive_tree._has_config_source("data"), "data.yaml should be a real source normally"
+    # If a step reads 'data' but the section has no real source, gate must fire.
+    import unittest.mock as mock
+    with mock.patch.object(derive_tree, "_has_config_source", lambda s: s != "data"):
+        try:
+            derive_tree.validate_reads({"dataset-loading": ["data"]},
+                                       ["data", "train", "quantization"])
+            assert False, "gate should fire for schema-backed section with no source"
+        except derive_tree.DeriveError as e:
+            assert "structured-config schema but no config/data.yaml" in str(e)
+
+
 # ------------------------------------------------------------- compose
 
 

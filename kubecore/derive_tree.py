@@ -126,6 +126,14 @@ SCHEMAS = {
     "quantization_schema": {"quantization": QuantizationConfig},
 }
 
+# Top-level sections that a structured-config schema backfills. A schema injects
+# its section (with dataclass defaults) into the composed tree EVEN IF the
+# section's yaml file was renamed/deleted — which would otherwise silently mask
+# the reads= gate (a rename typo renders "successfully" with only schema
+# defaults, and the developer's real values become an unread orphan section).
+# So the gate must additionally require a real on-disk source for these.
+SCHEMA_BACKED = {sec for node in SCHEMAS.values() for sec in node}
+
 
 def _register_schemas() -> None:
     """Schemas the yaml sections merge ONTO (defaults list puts the schema
@@ -258,14 +266,49 @@ def derive() -> DerivedForm:
     return form
 
 
+def _has_config_source(section: str) -> bool:
+    """True if the section is backed by a real on-disk config source that
+    actually contributes the section — either a `config/{section}/` group dir,
+    or a `config/{section}.yaml` whose top-level content includes the `{section}`
+    key. The key check matters: renaming the key INSIDE data.yaml (data: ->
+    dataX:) leaves the file present but no longer contributes `data`, so the
+    schema would silently backfill it. Detect that."""
+    if (CONFIG_DIR / section).is_dir():
+        return True
+    f = CONFIG_DIR / f"{section}.yaml"
+    if not f.is_file():
+        return False
+    try:
+        import yaml as _yaml
+        doc = _yaml.safe_load(f.read_text()) or {}
+        return isinstance(doc, dict) and section in doc
+    except Exception:
+        # If we can't parse it, assume it's a real source (don't false-fire).
+        return True
+
+
 def validate_reads(step_reads: dict, sections: list) -> None:
-    """Render gate: every section a step declares via reads= must exist
-    as a top-level section of the composed tree (closes the silent-failure
-    mode: tree section renamed but a step still reads it)."""
+    """Render gate: every section a step declares via reads= must exist as a
+    top-level section of the composed tree (closes the silent-failure mode:
+    tree section renamed but a step still reads it).
+
+    For SCHEMA_BACKED sections the composed tree alone is not enough — a
+    structured-config schema backfills the section even when its yaml file was
+    renamed/deleted, silently masking the rename. So a schema-backed section
+    also requires a real on-disk config source; otherwise the gate fires with a
+    rename-specific message."""
     for step_name, reads in step_reads.items():
         for section in reads:
             if section not in sections:
                 raise DeriveError(
                     f"step '{step_name}' reads config section '{section}' which does "
                     f"not exist in the config tree (top-level sections: {', '.join(sections)})"
+                )
+            if section in SCHEMA_BACKED and not _has_config_source(section):
+                raise DeriveError(
+                    f"step '{step_name}' reads config section '{section}', which has a "
+                    f"structured-config schema but no config/{section}.yaml (or "
+                    f"config/{section}/ group) — its yaml was likely renamed or deleted. "
+                    f"The schema backfills defaults, so the render would silently drop your "
+                    f"real values. Restore config/{section}.yaml (or update reads= + the schema)."
                 )
