@@ -159,19 +159,37 @@ def searchpath_override() -> str:
     return f"hydra.searchpath=[file://{PLATFORM_SEARCHPATH}]"
 
 
+def _compose(overrides: list, return_hydra_config: bool = False):
+    """Single choke point for Hydra compose. Reframes Hydra's
+    MissingConfigException (a defaults-list entry points at a group option file
+    that was deleted/renamed) as a clean, actionable DeriveError instead of a
+    raw Hydra stack trace + search-path dump."""
+    from hydra.errors import MissingConfigException
+    try:
+        with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
+            return compose(
+                config_name="config",
+                overrides=[searchpath_override()] + list(overrides or []),
+                return_hydra_config=return_hydra_config,
+            )
+    except MissingConfigException as exc:
+        # message looks like: In 'config': Could not find 'model/yolov8n'
+        raise DeriveError(
+            f"config tree is broken: {exc}. A defaults-list entry in config/config.yaml "
+            f"points at a group option that no longer exists — restore the option file "
+            f"(e.g. config/<group>/<option>.yaml) or fix the choice in config/config.yaml."
+        ) from exc
+
+
 def compose_tree(overrides: list = None):
     """Compose the config tree (+ the platform group via searchpath)."""
-    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
-        return compose(config_name="config", overrides=[searchpath_override()] + list(overrides or []))
+    return _compose(overrides)
 
 
 def _group_choices() -> dict:
     """{group_path: default_option} from the defaults list, via Hydra.
     Filtered to real group directories (schema entries etc. are not groups)."""
-    with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
-        hydra_cfg = compose(
-            config_name="config", overrides=[searchpath_override()], return_hydra_config=True
-        )
+    hydra_cfg = _compose([], return_hydra_config=True)
     return {
         k: v
         for k, v in hydra_cfg.hydra.runtime.choices.items()
