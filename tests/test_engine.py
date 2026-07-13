@@ -164,6 +164,28 @@ def test_size_cap():
 # ------------------------------------------------------------- enhancer (live-model fidelity)
 
 
+def test_wft_name_forced_app_scoped_no_cross_app_collision():
+    """The enhancer MUST force metadata.name to {app}-pipeline, overriding
+    whatever pipeline.py declared — so a template's hardcoded pipeline name
+    (copied into every seeded app) can't make one app's render overwrite
+    another app's WFT in the shared ml-{project} namespace."""
+    raw = _render()
+    hardcoded = raw["metadata"]["name"]  # whatever pipeline.py wrote
+    # enhance with a DIFFERENT app identity than the hardcoded name implies
+    ctx = dict(CONTEXT)
+    ctx["app"] = "some-other-app"
+    out = enhance.enhance(_render(), ctx, CATALOG)
+    assert out["metadata"]["name"] == "some-other-app-pipeline", \
+        f"expected forced name some-other-app-pipeline, got {out['metadata']['name']}"
+    assert out["metadata"]["name"] != hardcoded or hardcoded == "some-other-app-pipeline", \
+        "enhancer must not trust the developer's pipeline name for a different app"
+    # image ConfigMap must also be that app's, never another app's
+    cms = {p.get("valueFrom", {}).get("configMapKeyRef", {}).get("name")
+           for p in out["spec"]["arguments"]["parameters"]}
+    cms.discard(None)
+    assert cms == {"some-other-app-pipeline-images"}, f"image CM not app-scoped: {cms}"
+
+
 def test_per_step_class_params():
     wft = _enhanced()
     names = {p["name"] for p in wft["spec"]["arguments"]["parameters"]}

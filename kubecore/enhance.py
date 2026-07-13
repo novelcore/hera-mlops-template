@@ -120,8 +120,31 @@ def inject_disabled(annots: dict, source_name: str) -> bool:
 # ------------------------------------------------------------------ metadata
 
 
+def pipeline_wft_name(ctx: dict) -> str:
+    """The authoritative WorkflowTemplate name: {app}-pipeline. This is the
+    convention the k8smlapp composition seeds the placeholder with
+    ({{ $appName }}-pipeline), so the CI-rendered WFT must match it — otherwise
+    it lands as a DIFFERENT object in the shared ml-{project} namespace."""
+    app = ctx.get("app")
+    if not app:
+        raise EnhanceError("context is missing 'app' — cannot derive the WorkflowTemplate name")
+    return f"{app}-pipeline"
+
+
 def enhance_metadata(wft: dict, ctx: dict) -> None:
     meta = wft["metadata"]
+
+    # FORCE the WFT name to the app-authoritative {app}-pipeline, OVERRIDING
+    # whatever pipeline.py declared. The name is an IDENTITY / multi-tenant
+    # isolation concern the platform must own — not a developer choice. A
+    # template's hardcoded pipeline("yolo-training-pipeline") copied into every
+    # seeded app would otherwise make app B's render OVERWRITE app A's live WFT
+    # in the shared ml-{project} namespace (the cross-app contamination class).
+    # This is the one-and-only name authority, same rationale as force-
+    # overriding `image` (a supply-chain concern) — see enhance_image.
+    authoritative = pipeline_wft_name(ctx)
+    if meta.get("name") != authoritative:
+        meta["name"] = authoritative
     meta.setdefault("namespace", ctx["namespace"])
 
     labels = meta.setdefault("labels", {})
