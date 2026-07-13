@@ -1,0 +1,2 @@
+variant: "yolov11x-pose.pt" # largest/most accurate pose variant
+pretrained_weights: ""

@@ -1,0 +1,7 @@
+data:
+  ref: "main" # dataset (lakeFS ref) to train on
+  source: "lakefs" # 'lakefs' or 's3'
+  version: "" # provenance tag recorded in MLflow (derived from ref)
+  path_override: "" # optional s3:// override; empty = use the picked ref
+  sample_size: "" # integer sample size for reproducible subsets; empty = full dataset
+  seed: 42 # random seed for reproducible dataset sampling

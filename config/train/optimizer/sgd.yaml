@@ -1,0 +1,4 @@
+name: "SGD"
+lr: 0.01 # initial learning rate (Ultralytics lr0)
+momentum: 0.937
+weight_decay: 0.0005

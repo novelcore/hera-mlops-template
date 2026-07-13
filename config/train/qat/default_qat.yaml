@@ -1,0 +1,2 @@
+epochs: 10 # QAT fine-tune epochs (used when quantization.mode = qat)
+lr: 0.0001 # QAT fine-tune learning rate

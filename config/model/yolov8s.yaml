@@ -1,0 +1,2 @@
+variant: "yolov8s-pose.pt"
+pretrained_weights: ""

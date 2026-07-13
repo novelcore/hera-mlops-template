@@ -1,0 +1,101 @@
+project: PLACEHOLDER-project
+app: PLACEHOLDER-app
+pipelineName: PLACEHOLDER-pipeline
+namespace: PLACEHOLDER-namespace
+registryUrl: localhost:30500
+imageRepo: PLACEHOLDER-imagerepo
+lakefs:
+  endpoint: http://lakefs.internal.invalid
+  repository: PLACEHOLDER-repo
+  # externalUrl is the browser/CLI-facing ingress; render-wft
+  # writes it into the app repo's .kubecore/dataset-config.yaml.
+  externalUrl: "https://lakefs.internal.invalid"
+  adminSecret: PLACEHOLDER-lakefs-admin
+  adminSecretKeys:
+    accessKey: accessKeyId
+    secretKey: secretAccessKey
+mlflow:
+  trackingUri: http://mlflow.internal.invalid
+  svcSecret: PLACEHOLDER-mlflow-svc
+  oidcDomain: "oidc.internal.invalid"
+  oidcProjectId: "PLACEHOLDER-oidc-project-id"
+# computeClasses.{cpu,gpu} are the pool's two ML compute classes
+# (operator-selected one-per-tier from the live KubePool every
+# reconcile → class drift propagates here automatically). render-wft
+# routes each step to gpu iff it requests nvidia.com/gpu, else cpu,
+# and sizes the step's requests with node headroom from machineType.
+# Single source of truth = the KubePool; the KubeApp declares no
+# class selection.
+computeClasses:
+  cpu:
+    name: "cpu-standard"
+    tier: "cpu"
+    machineType: "n2-standard-8"
+    tolerationKey: "platform.kubecore.io/ml-workload"
+    tolerationValue: "cpu"
+    maxNodeCount: 4
+    diskSizeGb: 50
+    description: "n2-standard-8 (8 vCPU, 32 GiB) — CPU pipeline steps (headroom for model-quantization + heavier CPU steps; scale-from-0 so cost only during a step)"
+    # allocatable = whole-node CPU/memory a sole-tenant step may
+    # request on this class (capacity − GKE reservation − margin),
+    # computed by the operator from machineType. render-wft sizes
+    # each step requests==limits from this (whole-node model).
+    allocatable:
+      cpu: 7
+      memoryGiB: 27
+  gpu:
+    name: "gpu-t4"
+    tier: "gpu"
+    machineType: "n1-standard-8"
+    tolerationKey: "platform.kubecore.io/ml-workload"
+    tolerationValue: "gpu"
+    maxNodeCount: 1
+    diskSizeGb: 100
+    description: "n1-standard-8 + 1x T4 — YOLO training + qat-finetune (8 vCPU so qat cpu:4 request fits under allocatable; scale-from-0)"
+    guestAccelerator:
+      type: "nvidia-tesla-t4"
+      count: 1
+    # allocatable = whole-node CPU/memory a sole-tenant step may
+    # request on this class (capacity − GKE reservation − margin),
+    # computed by the operator from machineType. render-wft sizes
+    # each step requests==limits from this (whole-node model).
+    allocatable:
+      cpu: 7
+      memoryGiB: 25
+  # all = the full catalog of every cpu/gpu class the pool
+  # declares (a pool may offer >1 cpu class, e.g. a heavy ML
+  # class + a small scale-to-zero lightweight class). render-wft
+  # lists these as the allowed values in the cpu-class/gpu-class
+  # field help so a developer can choose, not blind-type.
+  all:
+    - name: "cpu-standard"
+      tier: "cpu"
+      machineType: "n2-standard-8"
+      description: "n2-standard-8 (8 vCPU, 32 GiB) — CPU pipeline steps (headroom for model-quantization + heavier CPU steps; scale-from-0 so cost only during a step)"
+      allocatable:
+        cpu: 7
+        memoryGiB: 27
+    - name: "kubecorecpu"
+      tier: "cpu"
+      machineType: "e2-standard-8"
+      description: "e2-standard-8 + 200GiB — CI builds (kaniko), sized for build-push req 4cpu/12Gi"
+      allocatable:
+        cpu: 7
+        memoryGiB: 27
+    - name: "gpu-t4"
+      tier: "gpu"
+      machineType: "n1-standard-8"
+      description: "n1-standard-8 + 1x T4 — YOLO training + qat-finetune (8 vCPU so qat cpu:4 request fits under allocatable; scale-from-0)"
+      guestAccelerator:
+        type: "nvidia-tesla-t4"
+        count: 1
+      allocatable:
+        cpu: 7
+        memoryGiB: 25
+hpc:
+  enabled: true
+  provider: "meluxina"
+checkpoints:
+  bucket: yolo
+  prefix: main/checkpoints
+serviceAccountName: argo-workflow

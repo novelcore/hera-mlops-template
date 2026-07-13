@@ -1,0 +1,4 @@
+name: "Adam"
+lr: 0.001
+momentum: 0.9 # Adam beta1
+weight_decay: 0.0

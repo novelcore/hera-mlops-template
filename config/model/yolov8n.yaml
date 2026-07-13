@@ -1,0 +1,2 @@
+variant: "yolov8n-pose.pt" # smallest/fastest pose variant
+pretrained_weights: "" # s3:// URI for custom weight-only init; empty = bundled

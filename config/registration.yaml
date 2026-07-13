@@ -1,0 +1,3 @@
+registration:
+  registered_model_name: "" # empty = service default (object-pose-yolo)
+  promote_to: "" # empty = no promotion; 'Staging' or 'Production'

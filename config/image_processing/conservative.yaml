@@ -1,0 +1,16 @@
+# Light-touch augmentation for small or fragile datasets.
+hsv_h: 0.005
+hsv_s: 0.3
+hsv_v: 0.2
+degrees: 0.0
+translate: 0.05
+scale: 0.2
+shear: 0.0
+perspective: 0.0
+flipud: 0.0
+fliplr: 0.0
+mosaic: 0.5
+mixup: 0.0
+copy_paste: 0.0
+erasing: 0.1
+bgr: 0.0

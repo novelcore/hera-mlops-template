@@ -1,0 +1,8 @@
+quantization:
+  mode: "none" # 'none' skips qat-finetune AND model-quantization; 'ptq' or 'qat'
+  image_size: 640 # must match train.image_size
+  calibration_frames: 512
+  calibration_seed: 42
+  parity_frames: 100 # frames for the INT8 vs FP32 parity check
+  parity_max_abs_error: 0.05 # run fails above this threshold
+  output_prefix: "quantization" # S3 key prefix for quantized artifacts

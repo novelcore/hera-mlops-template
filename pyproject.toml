@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yolo-training-pipeline"
+version = "0.1.0"
+description = "KubeCore ML pipeline (Hera DAG + Hydra experiment config)"
+requires-python = ">=3.11"
+# Render/compose-time dependencies. Pinned so the CI render is deterministic
+# (D4: determinism is a convention the lockfile enforces). The platform reads
+# this file with a standards-compliant installer (H9 — vanilla PEP 621, no
+# tool-specific sections).
+dependencies = [
+    "hera>=5.16,<6",
+    "hydra-core>=1.3,<1.4",
+    "omegaconf>=2.3,<2.4",
+    "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+# Step runtime deps live in each step's Dockerfile, not here — this file is the
+# render/compose surface. `dev` is for the local iteration loop.
+dev = []
+
+[project.scripts]
+# Console-script entrypoints so the in-image command matches local dev
+# invocation (O12d). Each step image installs this package and runs
+# `python -m app.entry` (see steps/*/Dockerfile).
+compose-and-validate = "kubecore.compose:main"
+
+[tool.setuptools]
+packages = ["kubecore"]

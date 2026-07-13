@@ -1,0 +1,9 @@
+# MOCKED — stands in for the output of the real ml-dataset-catalog-probe
+# (the CronJob that lists lakeFS refs whose root holds a data.yaml).
+# In production the enhancer would read the probe's ConfigMap; the shape
+# below mirrors what it publishes.
+repository: PLACEHOLDER-repo
+refs:
+  - main
+  - exp-aug-v2
+  - v1.3.0

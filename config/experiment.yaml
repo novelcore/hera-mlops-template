@@ -1,0 +1,3 @@
+experiment:
+  name: "object-pose-v1-yolov8n" # MLflow experiment name and S3 checkpoint path prefix
+  description: "" # optional free text stored in the MLflow run

@@ -1,0 +1,2 @@
+early_stopping_enabled: true # boolean — kill runs that stop improving
+patience: 50 # epochs without improvement before stopping

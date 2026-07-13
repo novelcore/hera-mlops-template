@@ -1,0 +1,16 @@
+# Standard YOLO pose augmentation recipe (kubeline defaults).
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 0.0 # keep 0.0 for pose — keypoints are rotation-sensitive
+translate: 0.1
+scale: 0.5
+shear: 0.0
+perspective: 0.0 # values > 0.001 cause severe keypoint displacement
+flipud: 0.0
+fliplr: 0.0
+mosaic: 1.0
+mixup: 0.0
+copy_paste: 0.0
+erasing: 0.4
+bgr: 0.0

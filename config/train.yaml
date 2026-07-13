@@ -1,0 +1,38 @@
+train:
+  # ── core schedule ──
+  epochs: 100 # total training epochs
+  batch_size: 16 # -1 for Ultralytics auto-batch
+  image_size: 640 # input resolution in pixels (multiple of 32)
+  # ── learning rate schedule ──
+  cos_lr: true # cosine learning rate schedule (genuine boolean leaf)
+  lrf: 0.01 # final LR ratio: final_lr = lr * lrf
+  warmup_epochs: 3.0
+  warmup_momentum: 0.8
+  # ── regularization ──
+  dropout: 0.0
+  label_smoothing: 0.0
+  # ── efficiency ──
+  nbs: 64 # nominal batch size for gradient scaling
+  freeze: "" # freeze first N backbone layers; empty = train all
+  amp: true # automatic mixed precision (boolean)
+  close_mosaic: 10 # disable mosaic for last N epochs
+  # ── reproducibility ──
+  seed: 0 # global training RNG seed (separate from data.seed)
+  deterministic: true # cuDNN deterministic mode (boolean)
+  # ── loss gains ──
+  loss:
+    pose: 12.0
+    kobj: 2.0
+    box: 7.5
+    cls: 0.5
+    dfl: 1.5
+  # ── checkpointing ──
+  checkpointing:
+    interval_epochs: 10 # upload an intermediate checkpoint every N epochs
+    storage_path: "" # override location; empty = platform-derived
+    resume_from: "" # empty = fresh, 'auto' = latest, or a full S3 path
+  # ── post-training export ──
+  export:
+    enabled: false # boolean
+    formats: "engine" # comma-separated: engine and/or onnx
+    precisions: "fp16" # comma-separated: fp16 and/or int8
