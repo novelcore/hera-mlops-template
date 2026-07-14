@@ -76,6 +76,9 @@ per-step compute-class selection + node scheduling from your KubePool's classes,
 per-run sizing knobs, `/dev/shm`, GitOps release, and the Argo submit form —
 all injected at release time. Your `pipeline.py` stays pure structure.
 
+**Adding your first step?** Start with **[ADD-A-STEP.md](ADD-A-STEP.md)** — a
+complete copy-paste walkthrough for newcomers (every command, every gotcha).
+
 See **[DEVELOPER.md](DEVELOPER.md)** for the complete operating manual, and
 **[MECHANISMS.md](MECHANISMS.md)** for how the platform works internally
 (add/remove steps, enhancement, runtime config flow, multi-tenant safety).

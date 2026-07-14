@@ -179,6 +179,10 @@ Per step:
 
 ## 5. Add a step
 
+> **New here? Read [ADD-A-STEP.md](ADD-A-STEP.md)** — a complete, copy-paste,
+> zero-assumptions walkthrough (every command, every gotcha, how to verify).
+> The version below is the quick reference once you know the shape.
+
 Three small edits — say we add `model-evaluation` after training:
 
 1. **config**: add a section for it (if it needs its own knobs):
