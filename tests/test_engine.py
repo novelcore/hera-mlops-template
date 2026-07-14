@@ -271,6 +271,29 @@ def test_dataset_catalog_enum():
     assert set(CATALOG["refs"]).issubset(set(by_name["data-ref"].get("enum", [])))
 
 
+def test_step_name_guards():
+    """Authoring guards give a clear error for the common add-a-step name
+    mistakes (empty, uppercase, duplicate) instead of a silent bad render or a
+    cryptic Hera NodeNameConflict."""
+    from kubecore.authoring import AuthoringError, pipeline, step
+
+    for bad in ("", "Bad_Name", "-lead", "trail-"):
+        try:
+            with pipeline("p"):
+                step(bad)
+            assert False, f"expected AuthoringError for step name {bad!r}"
+        except AuthoringError:
+            pass
+
+    try:
+        with pipeline("p"):
+            step("dup")
+            step("dup")
+        assert False, "expected AuthoringError for duplicate step name"
+    except AuthoringError as e:
+        assert "duplicate" in str(e)
+
+
 def _dag_tasks(wft):
     dag = next(t for t in wft["spec"]["templates"] if t["name"] == "main")
     return {t["name"]: t for t in dag["dag"]["tasks"]}

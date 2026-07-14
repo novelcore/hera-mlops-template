@@ -21,6 +21,7 @@ This is a render-time helper, not a runtime SDK.
 """
 
 import json
+import re
 
 from hera.workflows import DAG, Container, Parameter, Resources, WorkflowTemplate
 from hera.workflows.models import ValueFrom
@@ -28,6 +29,16 @@ from hera.workflows.models import ValueFrom
 from kubecore import derive_tree
 
 IMAGE = "platform-managed"  # sentinel; the platform always rewrites images
+
+# Step names become Argo template names + the steps/<dir> folder + the
+# image-<step> parameter, so they must be DNS-label-safe (lowercase alphanumeric
+# and hyphens, no leading/trailing hyphen). Validating here turns a silent bad
+# render (or a cryptic Hera NodeNameConflict) into a clear authoring error.
+_STEP_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+class AuthoringError(Exception):
+    pass
 COMPOSE_STEP = "compose-and-validate"
 PARAMS_PATH = "/work/params.yaml"
 # The compose step runs `python -m kubecore.compose` inside its own image;
@@ -51,6 +62,18 @@ class Step:
 def step(name, reads=None, gpu=False, needs=None, outputs=None, when=None) -> Step:
     if _current is None:
         raise RuntimeError("step() must be called inside `with pipeline(...):`")
+    if not isinstance(name, str) or not _STEP_NAME_RE.match(name):
+        raise AuthoringError(
+            f"step name {name!r} is invalid — use a DNS-label name: lowercase "
+            f"letters, digits and hyphens, no leading/trailing hyphen "
+            f"(e.g. 'model-evaluation'). The name becomes the Argo template, the "
+            f"steps/<dir> folder, and the image-<step> parameter."
+        )
+    if any(s.name == name for s in _current.steps):
+        raise AuthoringError(
+            f"duplicate step name {name!r} — every step must be uniquely named "
+            f"(it is the step's identity in the DAG and its image)."
+        )
     s = Step(name, reads, gpu, needs, outputs, when)
     _current.steps.append(s)
     return s
