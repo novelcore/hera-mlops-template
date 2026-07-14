@@ -23,7 +23,8 @@ HERE = Path(__file__).parent
 # each KubeApp gets its own uniquely-named WFT (no collisions across apps in a
 # shared namespace). You don't need to change it per app.
 with pipeline("ml-pipeline") as p:
-    load = step("dataset-loading", reads=["data"],
+    validate = step("config-validation", reads=["data", "model"])
+    load = step("dataset-loading", reads=["data"], needs=[validate],
                 outputs=["data-yaml", "manifest-summary"])
     train = step("model-training", gpu=True, needs=[load],
                  reads=["experiment", "data", "model", "train", "image_processing", "logging"],

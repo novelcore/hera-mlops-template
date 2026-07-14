@@ -271,6 +271,63 @@ def test_dataset_catalog_enum():
     assert set(CATALOG["refs"]).issubset(set(by_name["data-ref"].get("enum", [])))
 
 
+def _dag_tasks(wft):
+    dag = next(t for t in wft["spec"]["templates"] if t["name"] == "main")
+    return {t["name"]: t for t in dag["dag"]["tasks"]}
+
+
+def test_first_two_steps_present_and_ordered():
+    """The two real first steps are wired: compose-and-validate (platform) ->
+    config-validation -> dataset-loading -> model-training."""
+    wft = _enhanced()
+    tasks = _dag_tasks(wft)
+    for name in ("compose-and-validate", "config-validation", "dataset-loading",
+                 "model-training"):
+        assert name in tasks, f"missing DAG task {name}"
+    # config-validation gates on compose; dataset-loading gates on both;
+    # model-training gates on dataset-loading (all pre-GPU work done first).
+    assert "compose-and-validate" in tasks["config-validation"]["depends"]
+    assert "config-validation" in tasks["dataset-loading"]["depends"]
+    assert "dataset-loading" in tasks["model-training"]["depends"]
+
+
+def test_dataset_loading_emits_step_outputs():
+    """dataset-loading exposes the data-yaml + manifest-summary outputs
+    model-training consumes (the object-store handoff, not shared disk)."""
+    wft = _enhanced()
+    tmpl = next(t for t in wft["spec"]["templates"] if t["name"] == "dataset-loading")
+    outs = {p["name"] for p in tmpl.get("outputs", {}).get("parameters", [])}
+    assert {"data-yaml", "manifest-summary"}.issubset(outs), outs
+
+
+def test_every_declared_step_has_a_buildable_dockerfile():
+    """Robustness gate: every step the pipeline declares must have a buildable
+    steps/<dir>/Dockerfile (or the image escape-hatch), so a forgotten
+    Dockerfile is caught at render time — not as a run-time ImagePullBackOff."""
+    wft = _enhanced()
+    steps = [t for t in wft["spec"]["templates"] if "container" in t]
+    missing = []
+    for t in steps:
+        annotations = t.get("metadata", {}).get("annotations", {})
+        if "platform.kubecore.io/image" in annotations:
+            continue
+        dockerfile = ROOT / "steps" / t["name"].replace("-", "_") / "Dockerfile"
+        if not dockerfile.is_file():
+            missing.append(t["name"])
+    assert not missing, f"steps with no buildable Dockerfile: {missing}"
+
+
+def test_first_two_steps_get_platform_env():
+    """The platform auto-injects data-source env into the first two steps —
+    a developer wires no endpoints/credentials."""
+    wft = _enhanced()
+    for step_name in ("config-validation", "dataset-loading"):
+        tmpl = next(t for t in wft["spec"]["templates"] if t["name"] == step_name)
+        env = {e["name"] for e in tmpl["container"].get("env", [])}
+        assert {"MLFLOW_TRACKING_URI", "LAKEFS_ENDPOINT", "LAKEFS_ACCESS_KEY"}.issubset(env), \
+            f"{step_name} missing injected platform env: {env}"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
