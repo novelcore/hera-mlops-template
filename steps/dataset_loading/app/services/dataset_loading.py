@@ -1824,7 +1824,15 @@ class DatasetLoadingService:
                         "  [FAIL] labels/%s/ exists but is empty", split
                     )
             else:
-                if is_required:
+                if mode == "manifest-only":
+                    # manifest-only streams BOTH images and labels from object
+                    # storage at train time — nothing is on local disk, so a
+                    # missing labels/ dir is expected, not a failure.
+                    self._logger.info(
+                        "  [SKIP] labels/%s/ not downloaded (manifest-only mode)",
+                        split,
+                    )
+                elif is_required:
                     failures.append(f"labels/{split}/ missing")
                     self._logger.warning("  [FAIL] labels/%s/ missing", split)
                 else:
