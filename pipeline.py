@@ -24,6 +24,7 @@ HERE = Path(__file__).parent
 # shared namespace). You don't need to change it per app.
 with pipeline("ml-pipeline") as p:
     validate = step("config-validation", reads=["data", "model"])
+    ghost = step("ghost-step", reads=["data"], needs=[validate])
     load = step("dataset-loading", reads=["data"], needs=[validate],
                 outputs=["data-yaml", "manifest-summary"])
     train = step("model-training", gpu=True, needs=[load],
