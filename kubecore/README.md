@@ -66,7 +66,7 @@ context (H6). Local-dev fallbacks live in `kubecore/local-dev/` and `kubecore/co
 
 ## Tests
 
-`tests/test_engine.py` — 21 assertions, run offline: `python -m pytest tests/` or
+`tests/test_engine.py` — 23 assertions, run offline: `python -m pytest tests/` or
 `python tests/test_engine.py`. Covers derivation, both gates, group-swap elision,
 the ADVANCED platform guard, enum validation, the size cap, byte-stability, the
 app-scoped-name anti-collision enforcement, and the schema-rename gate.

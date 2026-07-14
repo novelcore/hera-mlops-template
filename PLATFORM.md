@@ -93,6 +93,17 @@ goes through git, by design).
 ## Verification
 
 - Offline: `./run.sh` (render→enhance→compose) and `python tests/test_engine.py`
-  (21 assertions) in any app repo.
-- In-cluster: the credential-split render (clone token → render tokenless →
-  enhance → gate) has been validated live on gke-dev against a private app repo.
+  (23 assertions) in any app repo.
+- In-cluster (validated live on gke-dev, end-to-end): create KubeApp → operator
+  seeds the app repo → push → CI clone (token) → detect Hera frontend → build all
+  6 step images → **render-hera tokenless** → enhance (forced `{app}-pipeline`
+  name) → gate → commit to gitops → **no Crossplane revert** (WFT/images MRs stay
+  Synced) → ArgoCD sync → **submittable** WFT → real run: `compose-and-validate`
+  composed+validated the Hydra config into a real `params.yaml`, `dataset-loading`
+  ran, `model-training` scheduled with the correct GPU request + the CI-built
+  image. The GPU training container itself is gated only on GPU node capacity in
+  the zone (a GCP T4 stockout during validation, not a platform issue).
+- Whole-node GPU sizing: GPU compute-class allocatable subtracts an extra GPU
+  node headroom (nvidia device-plugin + driver + larger system reservation) so a
+  training step actually fits a fresh accelerator node — verified live (25 GiB
+  never scheduled a T4 node; the corrected 22 GiB triggered the scale-up).
