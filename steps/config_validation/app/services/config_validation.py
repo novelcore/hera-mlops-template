@@ -130,16 +130,32 @@ class ConfigValidationService:
     def _check_dataset_path(self, s3, data: dict, platform: dict) -> None:
         uri = self._dataset_prefix(data, platform)
         parsed = urlparse(uri)
+        bucket, prefix = parsed.netloc, parsed.path.lstrip("/")
         self._log.info("checking dataset path %s", uri)
-        resp = s3.list_objects_v2(
-            Bucket=parsed.netloc, Prefix=parsed.path.lstrip("/"), MaxKeys=1
-        )
+        try:
+            resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+        except Exception as exc:  # NoSuchBucket etc. — a repo/branch typo
+            raise ConfigValidationError(
+                f"dataset path unreachable: {uri} — the repository/branch may not "
+                f"exist ({exc})"
+            ) from exc
         if resp.get("KeyCount", 0) == 0:
             raise ConfigValidationError(
                 f"dataset path not found or empty: {uri} — check the ref/version "
                 f"and that the dataset was uploaded."
             )
-        self._log.info("dataset path OK (%s)", uri)
+        # A non-empty prefix isn't enough: require data.yaml at the root so a run
+        # doesn't pass config-validation and then fail in dataset-loading on a
+        # missing/misplaced data.yaml. Cheap (one HEAD), and closes the biggest
+        # false-confidence gap between the two steps.
+        try:
+            s3.head_object(Bucket=bucket, Key=prefix + "data.yaml")
+        except Exception as exc:
+            raise ConfigValidationError(
+                f"dataset at {uri} has no data.yaml at its root — a valid "
+                f"Ultralytics YOLO dataset must include data.yaml ({exc})"
+            ) from exc
+        self._log.info("dataset path OK (%s, data.yaml present)", uri)
 
     def _check_pretrained_weights(self, s3, model: dict) -> None:
         weights = model.get("pretrained_weights")

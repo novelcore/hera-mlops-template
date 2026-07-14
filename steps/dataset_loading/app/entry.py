@@ -44,6 +44,17 @@ DATASET_DIR = "/work/dataset"
 OUTPUT_DIR = Path("/work/output")
 
 
+def _int_field(value, name: str, default: int) -> int:
+    """Coerce a form value to int with a clear error (not a raw ValueError)."""
+    raw = str(value).strip() if value is not None else ""
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+
+
 def _resolve_dataset_params(cfg: dict) -> dict:
     """Map the experiment `data` config slice + platform lakeFS repo onto the
     dataset-loading service's run parameters.
@@ -64,9 +75,24 @@ def _resolve_dataset_params(cfg: dict) -> dict:
     ref = str(data.get("ref") or "main")
     version = str(data.get("version") or "") or ref
 
-    # sample_size is a string in the form ("" = full dataset); coerce to int/None.
+    # sample_size is a string in the form ("" = full dataset); coerce to a
+    # positive int, or None when empty. A bad value is a form mistake, so fail
+    # with a clear message here rather than a raw int() ValueError or a verbose
+    # Pydantic error deep in the service.
     raw_sample = str(data.get("sample_size") or "").strip()
-    sample_size = int(raw_sample) if raw_sample else None
+    if raw_sample:
+        try:
+            sample_size = int(raw_sample)
+        except ValueError:
+            raise ValueError(
+                f"data.sample_size must be a positive integer or empty, got {raw_sample!r}"
+            )
+        if sample_size < 1:
+            raise ValueError(
+                f"data.sample_size must be >= 1 (or empty for the full dataset), got {sample_size}"
+            )
+    else:
+        sample_size = None
 
     params = {
         "version": version,
@@ -77,7 +103,7 @@ def _resolve_dataset_params(cfg: dict) -> dict:
         # platform does not provide; the service supports them for local use.
         "manifest_only": True,
         "sample_size": sample_size,
-        "seed": int(data.get("seed", 42)),
+        "seed": _int_field(data.get("seed", 42), "data.seed", default=42),
     }
 
     path_override = str(data.get("path_override") or "").strip()

@@ -423,6 +423,16 @@ class DatasetLoadingService:
         # 3. Write / update the path field in data.yaml
         self._write_data_yaml(output_path, params.output_dir)
 
+        # 3b. Pre-GPU label spot-check. Manifest-only downloads NO labels (they
+        # stream at train time), so a malformed label would otherwise only fail
+        # AFTER the expensive GPU node spins up and training parses it. Download
+        # and validate a small bounded SAMPLE of labels per split here, on the
+        # cheap CPU step, so a format error fails fast — cheap insurance, not a
+        # full download (that would defeat manifest-only).
+        self._spot_check_label_content(
+            bucket, prefix, output_path, listing.label_keys
+        )
+
         # 4. Optionally sample S3 keys
         sampled = False
         image_keys = listing.image_keys
@@ -986,6 +996,62 @@ class DatasetLoadingService:
                                 f"Label format error in {label_path} line {lineno}: "
                                 f"keypoint visibility={vis} not in {{0, 1, 2}}"
                             )
+
+    # ------------------------------------------------------------------
+    # Manifest-only pre-GPU label spot-check
+    # ------------------------------------------------------------------
+
+    def _spot_check_label_content(
+        self,
+        bucket: str,
+        prefix: str,
+        output_path: Path,
+        label_keys: list[str],
+    ) -> None:
+        """Download and content-validate a bounded sample of labels per split.
+
+        Used in manifest-only mode, where no labels are downloaded, so that a
+        malformed label (wrong token count, out-of-range bbox/keypoint, bad
+        visibility) fails on THIS cheap CPU step instead of after a GPU node
+        spins up. Samples up to ``_SPOT_CHECK_LINES`` label files per split;
+        validates each with the same rules inline validation uses.
+        """
+        if not label_keys:
+            return
+
+        data_cfg = self._validate_data_yaml(output_path)
+        kpt_shape = data_cfg["kpt_shape"]
+        num_classes = len(data_cfg["names"])
+        expected_tokens = 1 + 4 + kpt_shape[0] * kpt_shape[1]
+
+        # Group label keys by split, deterministically pick a bounded sample.
+        by_split: dict[str, list[str]] = {}
+        for key in label_keys:
+            parts = Path(key).parts
+            try:
+                split = parts[parts.index("labels") + 1]
+            except (ValueError, IndexError):
+                continue
+            by_split.setdefault(split, []).append(key)
+
+        checked = 0
+        for split in SPLITS:
+            sample = sorted(by_split.get(split, []))[:_SPOT_CHECK_LINES]
+            for key in sample:
+                relative = key[len(prefix):]
+                local = output_path / relative
+                local.parent.mkdir(parents=True, exist_ok=True)
+                self._s3.download_file(bucket, key, str(local))
+                self._validate_label_file_inline(
+                    local, expected_tokens, num_classes, kpt_shape
+                )
+                checked += 1
+
+        self._logger.info(
+            "Manifest-only label spot-check PASSED | %d label file(s) content-validated "
+            "(pre-GPU fail-fast; full validation streams at train time)",
+            checked,
+        )
 
     # ------------------------------------------------------------------
     # Labels-only helpers
