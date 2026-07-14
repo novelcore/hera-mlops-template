@@ -70,3 +70,9 @@ context (H6). Local-dev fallbacks live in `kubecore/local-dev/` and `kubecore/co
 `python tests/test_engine.py`. Covers derivation, both gates, group-swap elision,
 the ADVANCED platform guard, enum validation, the size cap, byte-stability, the
 app-scoped-name anti-collision enforcement, and the schema-rename gate.
+
+## The full mechanism
+
+For the end-to-end machinery (render → enhance → submit → compose, add/remove
+step internals, runtime config flow, multi-tenant safety, credential split, the
+no-Crossplane-revert handoff), see [../MECHANISMS.md](../MECHANISMS.md).
