@@ -295,9 +295,12 @@ its own machine with its own disk. Move data like this:
 
 ---
 
-## 10. Local iteration loop
+## 10. Local iteration loop (authoring preview only — not a way to run the pipeline)
 
-No cluster needed:
+This is a **render preview**, not a run. It lets you check your DAG and see the
+resolved `params.yaml` on a laptop before you push. **Pipelines only ever run in
+the cluster, submitted from Argo Workflows** (§12) — there is no local execution
+and no local submit. No cluster needed for the preview:
 
 ```bash
 ./run.sh                                  # or the commands below
@@ -306,7 +309,7 @@ python -m kubecore.compose --output out/params.yaml         # composed defaults
 python -m kubecore.compose train.epochs=5 train/optimizer=adamw   # try overrides
 ```
 
-`out/params.yaml` is exactly what your steps will receive. Errors you
+`out/params.yaml` is exactly what your steps will receive at run time. Errors you
 can hit, verbatim:
 
 **A step reads a section that doesn't exist** (typo, or you renamed a
@@ -396,7 +399,7 @@ local fallback file, so `python steps/model_training/entry.py --params
 
 ---
 
-## 12. Running the pipeline
+## 12. Running the pipeline (from Argo Workflows only)
 
 Open the workflow template in the Argo UI, press **Submit**:
 
