@@ -1,8 +1,19 @@
+# LOCAL-DEV pipeline-context — PLACEHOLDER values only.
+#
+# This file exists ONLY so `python -m kubecore.enhance` can be exercised on a
+# laptop. In production the platform NEVER reads this copy: the k8smlapp
+# Crossplane composition writes the real pipeline-context (real endpoints, the
+# lakeFS admin secret NAME, OIDC ids, per-project compute catalog) into the
+# private gitops repo in-cluster, and `ml-ci-build` reads it at CI render time.
+#
+# PROHIBITED: real endpoints, secret names, OIDC ids, or cluster DNS in this
+# (or any) repo. Those are platform-internal and derived live from the runtime.
+# Developers must not see them. Keep everything below non-functional.
 project: PLACEHOLDER-project
 app: PLACEHOLDER-app
 pipelineName: PLACEHOLDER-pipeline
 namespace: PLACEHOLDER-namespace
-registryUrl: localhost:30500
+registryUrl: registry.internal.invalid
 imageRepo: PLACEHOLDER-imagerepo
 lakefs:
   endpoint: http://lakefs.internal.invalid
@@ -96,6 +107,6 @@ hpc:
   enabled: true
   provider: "meluxina"
 checkpoints:
-  bucket: yolo
+  bucket: PLACEHOLDER-bucket
   prefix: main/checkpoints
 serviceAccountName: argo-workflow

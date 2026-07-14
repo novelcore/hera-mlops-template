@@ -10,5 +10,9 @@ versions:
 - `dataset-catalog.yaml` — stand-in for the `ml-dataset-catalog-probe` output
   (the lakeFS refs that become the `data-ref` dropdown).
 
-The values here are real (captured from gke-dev/yolo) so local renders match the
-cluster closely, but the platform always uses the live versions at release time.
+The values here are **non-functional placeholders** (`PLACEHOLDER-*`,
+`*.internal.invalid`). Real endpoints, secret names, and OIDC ids are
+platform-internal — they are injected LIVE at CI render time from the
+operator-written gitops `pipeline-context.yaml`, and must never be committed to
+this (or any) repo. Local renders show the correct *shape*; the platform always
+uses the live versions at release time.

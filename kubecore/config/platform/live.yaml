@@ -1,10 +1,15 @@
-# Platform config group — LOCAL-DEV FALLBACK.
+# Platform config group — LOCAL-DEV FALLBACK (placeholder values only).
 #
 # In the cluster the platform materializes this group from your project's
 # pipeline-context ConfigMap, so `cfg.platform.*` is real at run time and you
 # never edit it. This vendored copy exists ONLY so `python pipeline.py` and
 # `python -m kubecore.compose` work on a laptop with no cluster. The platform
 # overrides the searchpath (KUBECORE_PLATFORM_SEARCHPATH) in CI/runtime.
+#
+# IMPORTANT: these are NON-FUNCTIONAL placeholders. Real endpoints, bucket
+# names, and credentials are platform-internal and are injected LIVE at CI
+# render time from the operator-written gitops pipeline-context — never
+# committed to a repo. Do not paste live cluster values here.
 #
 # Excluded from the submit form (it is platform-injected, not a developer knob).
 checkpoints:
