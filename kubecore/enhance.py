@@ -388,8 +388,10 @@ def enhance_sizing_knobs(spec: dict, step: dict, compute_class: dict) -> None:
         if name not in existing:
             parameters.append(
                 {
+                    # arguments.parameters need `value` (not `default`) — Argo
+                    # rejects a workflow whose arguments param lacks value/valueFrom
                     "name": name,
-                    "default": default,
+                    "value": default,
                     "description": f"Per-run resource override for step '{step_name}'.",
                 }
             )

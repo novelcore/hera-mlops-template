@@ -64,7 +64,8 @@ def test_boolean_is_plain_value():
     form = derive_tree.derive()
     by_name = {p.name: p for p in form.parameters}
     amp = by_name["train-amp"]
-    assert amp.default in ("true", "false")
+    # arguments.parameters carry `value` (not `default`) so Argo accepts the WFT
+    assert amp.value in ("true", "false")
     assert amp.enum is None, "booleans must NOT carry an enum (O9 dead)"
 
 
@@ -162,6 +163,18 @@ def test_size_cap():
 
 
 # ------------------------------------------------------------- enhancer (live-model fidelity)
+
+
+def test_every_arguments_param_is_submittable():
+    """Argo REJECTS a workflow whose spec.arguments.parameters has an entry
+    lacking `value`/`valueFrom` (a `default` alone is invalid there). Every
+    derived + enhancer-injected form param must carry value/valueFrom, else the
+    rendered WFT can't be submitted at all. (Regression: caught live when a run
+    failed 'spec.arguments.image_processing.value ... is required'.)"""
+    wft = _enhanced()
+    bad = [p["name"] for p in wft["spec"]["arguments"]["parameters"]
+           if "value" not in p and "valueFrom" not in p]
+    assert not bad, f"arguments params missing value/valueFrom (unsubmittable): {bad}"
 
 
 def test_wft_name_forced_app_scoped_no_cross_app_collision():

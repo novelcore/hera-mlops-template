@@ -71,7 +71,7 @@ SCHEMA_SECTIONS = ("data", "quantization")
 
 ADVANCED_PARAM_KWARGS = dict(
     name="config",
-    default="",
+    value="",
     description=(
         "ADVANCED: override YAML merged LAST over the composed config "
         "(OmegaConf.merge). Overrides everything above — intended for "
@@ -259,7 +259,7 @@ def derive() -> DerivedForm:
         form.parameters.append(
             Parameter(
                 name=name,
-                default=default,
+                value=default,  # arguments.parameters need `value`, not `default`
                 enum=options,
                 description=f"Config group '{group}': swaps the whole subtree "
                 f"(options: {', '.join(options)}).",
@@ -275,7 +275,7 @@ def derive() -> DerivedForm:
         default = _value_str(value)
         enum = [str(m.value) for m in type(value)] if isinstance(value, Enum) else None
         form.parameters.append(
-            Parameter(name=name, default=default, enum=enum, description=f"Config: {dotted}")
+            Parameter(name=name, value=default, enum=enum, description=f"Config: {dotted}")
         )
         form.tokens.append(f"{dotted}={{{{workflow.parameters.{name}}}}}")
         form.render_defaults[dotted] = default
