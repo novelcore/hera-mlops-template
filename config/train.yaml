@@ -36,3 +36,5 @@ train:
     enabled: false # boolean
     formats: "engine" # comma-separated: engine and/or onnx
     precisions: "fp16" # comma-separated: fp16 and/or int8
+
+# CI verification: trivial no-op change to trigger the render check.
