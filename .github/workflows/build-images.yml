@@ -13,7 +13,9 @@ name: main — build step images
 
 on:
   push:
-    branches: [main]
+    # The template repo uses `main`; a seeded ML app's CI branch is typically
+    # `dev`. Build (and emit per-step status) on a push to either.
+    branches: [main, dev]
 
 permissions:
   contents: read

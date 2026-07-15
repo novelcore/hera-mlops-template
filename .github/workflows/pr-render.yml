@@ -16,7 +16,11 @@ name: PR — render WorkflowTemplate
 
 on:
   pull_request:
-    branches: [main]
+    # Fire on PRs into whichever branch your app develops on. The template repo
+    # uses `main`; a seeded ML app's CI branch is typically `dev` — so a PR into
+    # either gets the WFT render-validation check. (Argo CI renders on the push
+    # after merge; this is the pre-merge safety net.)
+    branches: [main, dev]
 
 permissions:
   contents: read
