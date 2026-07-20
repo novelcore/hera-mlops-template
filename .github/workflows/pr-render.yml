@@ -1,6 +1,6 @@
-# PR → main: render the WorkflowTemplate and report back.
+# PR → dev: render the WorkflowTemplate and report back.
 #
-# On every PR to main this renders your pipeline exactly the way the platform
+# On every PR to dev this renders your pipeline exactly the way the platform
 # does (pipeline.py -> enhance -> release-hygiene gate), using a placeholder
 # platform context (the real endpoints/secrets are injected in-cluster, never
 # in a repo — so a PR check needs no cluster). It then:
@@ -16,11 +16,12 @@ name: PR — render WorkflowTemplate
 
 on:
   pull_request:
-    # Fire on PRs into whichever branch your app develops on. The template repo
-    # uses `main`; a seeded ML app's CI branch is typically `dev` — so a PR into
-    # either gets the WFT render-validation check. (Argo CI renders on the push
-    # after merge; this is the pre-merge safety net.)
-    branches: [main, dev]
+    # dev is THE branch an ML app develops on: the platform seeds `main` with the
+    # template content and immediately defaults the repo to `dev`, and the
+    # in-cluster CI only listens for pushes to dev (the WorkflowEventBinding
+    # selector is refs/heads/{devBranch}). Firing on `main` too would gate PRs
+    # that the platform will never build — a check that can only mislead.
+    branches: [dev]
 
 permissions:
   contents: read
@@ -82,6 +83,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           ARGO_UI_URL: ${{ vars.ARGO_UI_URL }}
+          ML_NAMESPACE: ${{ vars.ML_NAMESPACE }}
         with:
           script: |
             const fs = require('fs');
@@ -100,17 +102,30 @@ jobs:
             // 2) PR comment (create or update the single marker comment)
             const marker = '<!-- hera-wft-render -->';
             const argo = process.env.ARGO_UI_URL || '';
+            // The app's WorkflowTemplate name is "{app}-pipeline". Derive {app}
+            // from the repo name ("{project}-{app}" for seeded repos, e.g.
+            // "yolo-hera-yolo" -> app "hera-yolo"); fall back to the repo name.
+            const repoName = context.repo.repo;
+            const app = repoName.includes('-') ? repoName.split('-').slice(1).join('-') : repoName;
+            const wftName = `${app}-pipeline`;
+            // Link to the app's WorkflowTemplate in the Argo UI when the URL is set.
+            // Argo's route is /workflow-templates/{namespace}/{name} — a query
+            // string (?template=) is NOT a route and lands on a 404. The ML
+            // namespace is ml-{project}, and {project} is the repo-name prefix
+            // ("yolo-hera-yolo" -> project "yolo" -> namespace "ml-yolo").
+            const project = repoName.includes('-') ? repoName.split('-')[0] : repoName;
+            const mlNamespace = process.env.ML_NAMESPACE || `ml-${project}`;
+            const argoLink = argo
+              ? `[Argo Workflows UI](${argo.replace(/\/+$/, '')}/workflow-templates/${mlNamespace}/${wftName}) → \`${wftName}\``
+              : `the Argo Workflows UI → \`${wftName}\` _(set the \`ARGO_UI_URL\` repo variable to link it here)_`;
             let body;
             if (ok) {
               const steps = '${{ steps.summary.outputs.stepnames }}'.split(',').filter(Boolean);
               const dag = steps.map(s => '`' + s + '`').join(' → ');
-              const argoLine = argo
-                ? `\n**Runs here after merge:** [Argo Workflows UI](${argo}) → \`{app}-pipeline\``
-                : `\n_Set the \`ARGO_UI_URL\` repo variable to link the Argo UI here._`;
               body = `${marker}\n### ✅ WorkflowTemplate render OK\n` +
                      `**Steps (${'${{ steps.summary.outputs.steps }}'}):** ${dag}\n` +
                      `**Form parameters:** ${'${{ steps.summary.outputs.params }}'}\n` +
-                     argoLine +
+                     `\n**Runs here after merge:** ${argoLink}` +
                      `\n\n_Structural render only — the pipeline runs in Argo Workflows after merge + image build._`;
             } else {
               const err = (read('render.err') || read('render.out') || 'no output captured').slice(-3000);
@@ -118,7 +133,8 @@ jobs:
                      `The platform could not render your pipeline. Fix this before merge:\n\n` +
                      '```\n' + err + '\n```\n' +
                      `\n_Common causes: a \`reads=\` section that no longer exists, a bad group default, ` +
-                     `a duplicate parameter, or a step folder without a Dockerfile. See DEVELOPER.md §10._`;
+                     `a duplicate parameter, or a step folder without a Dockerfile. See DEVELOPER.md §10._` +
+                     `\n\n_Once fixed, this pipeline runs at:_ ${argoLink}`;
             }
 
             const {data: comments} = await github.rest.issues.listComments({
