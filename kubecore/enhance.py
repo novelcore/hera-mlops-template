@@ -318,6 +318,21 @@ def enhance_env(step: dict, ctx: dict, annots: dict) -> None:
         add({"name": "CHECKPOINT_PREFIX", "value": str(checkpoints.get("prefix", ""))})
 
 
+# How long a step may sit Pending before the platform calls it unschedulable.
+# A step whose node cannot be created (cloud capacity stockout, exhausted quota,
+# a class whose pool is at max) otherwise waits FOREVER with no signal: Argo does
+# not time out a Pending pod, and the developer sees a run that is neither
+# succeeding nor failing. Alexandra's run sat Pending 17 HOURS this way
+# (2026-07-15), and a GPU stockout reproduced it exactly (2026-07-16: 105
+# FailedScaleUp over 2d5h, still Pending).
+#
+# GPU steps get longer: accelerator pools legitimately take minutes to scale from
+# zero, and a transient stockout often clears. The point is not to fail fast —
+# it is to fail *visibly* instead of hanging silently until someone notices.
+PENDING_DEADLINE_SECONDS = 1800  # CPU steps: 30 min
+GPU_PENDING_DEADLINE_SECONDS = 5400  # GPU steps: 90 min (scale-from-zero + retries)
+
+
 def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
     compute_class = resolve_compute_class(step, ctx, annots)
     gpu = is_gpu_step(step)
@@ -329,6 +344,13 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
         selector_value = f"{{{{workflow.parameters.{step['name']}-class}}}}"
     step.setdefault("nodeSelector", {}).setdefault(
         "platform.kubecore.io/nodegroup-type", selector_value
+    )
+
+    # Bound how long this step may sit unschedulable (see the constants above).
+    # fill-absent: a developer who set their own deadline keeps it.
+    step.setdefault(
+        "activeDeadlineSeconds",
+        GPU_PENDING_DEADLINE_SECONDS if gpu else PENDING_DEADLINE_SECONDS,
     )
 
     tolerations = step.setdefault("tolerations", [])
@@ -360,6 +382,74 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
     if gpu:
         requests.setdefault("nvidia.com/gpu", "1")
         limits.setdefault("nvidia.com/gpu", "1")
+
+
+def _parse_cpu(value) -> float:
+    """Kubernetes CPU quantity -> cores ("500m" -> 0.5, "2" -> 2.0)."""
+    text = str(value).strip()
+    if text.endswith("m"):
+        return float(text[:-1]) / 1000.0
+    return float(text)
+
+
+_MEM_UNITS = {
+    "Ki": 1 / (1024 * 1024), "Mi": 1 / 1024, "Gi": 1.0, "Ti": 1024.0,
+    "K": 1000 / 1024**3, "M": 1000**2 / 1024**3, "G": 1000**3 / 1024**3,
+}
+
+
+def _parse_mem_gib(value) -> float:
+    """Kubernetes memory quantity -> GiB ("512Mi" -> 0.5, "27Gi" -> 27.0)."""
+    text = str(value).strip()
+    for suffix, factor in _MEM_UNITS.items():
+        if text.endswith(suffix):
+            return float(text[: -len(suffix)]) * factor
+    return float(text) / 1024**3  # bare bytes
+
+
+def validate_scheduling(step: dict, compute_class: dict) -> None:
+    """Fail the render if this step can NEVER schedule on its compute class.
+
+    The step's requests are compared against the class's whole-node budget
+    (capacity minus the node's kube-reservation and DaemonSet footprint, computed
+    by the platform). A request above that budget produces a pod that sits
+    Pending on "Insufficient cpu/memory" forever — a run that burns hours before
+    anyone notices. Catching it at render time turns a silent hang into a build
+    error naming the step, the class, and the number that does not fit.
+
+    Only what is knowable at render time is checked: a per-run {step}-cpu/-mem
+    override can still overshoot, so the same budget is what those knobs default
+    to.
+    """
+    allocatable = compute_class.get("allocatable")
+    if not allocatable:
+        return  # unknown machine type: the platform omits allocatable, nothing to check
+    requests = step["container"].get("resources", {}).get("requests", {})
+    step_name = step["name"]
+    class_name = compute_class.get("name", "?")
+    machine = compute_class.get("machineType", "?")
+
+    if "cpu" in requests:
+        want = _parse_cpu(requests["cpu"])
+        if want > allocatable["cpu"]:
+            raise EnhanceError(
+                f"step '{step_name}' requests {requests['cpu']} cpu but compute class "
+                f"'{class_name}' ({machine}) can only give a pod {allocatable['cpu']} cpu — "
+                f"the pod would never schedule. Lower the request or pick a bigger class."
+            )
+    if "memory" in requests:
+        want = _parse_mem_gib(requests["memory"])
+        if want > allocatable["memoryGiB"]:
+            raise EnhanceError(
+                f"step '{step_name}' requests {requests['memory']} memory but compute class "
+                f"'{class_name}' ({machine}) can only give a pod {allocatable['memoryGiB']}Gi — "
+                f"the pod would never schedule. Lower the request or pick a bigger class."
+            )
+    if is_gpu_step(step) and not compute_class.get("guestAccelerator"):
+        raise EnhanceError(
+            f"step '{step_name}' requests a GPU but compute class '{class_name}' "
+            f"({machine}) has no accelerator — the pod would never schedule."
+        )
 
 
 def enhance_sizing_knobs(spec: dict, step: dict, compute_class: dict) -> None:
@@ -487,6 +577,45 @@ def enhance_dynamic_enums(spec: dict, ctx: dict, catalog: dict) -> None:
         set_enum("data-ref", list(catalog.get("refs", [])))
 
 
+def enhance_platform_group(steps: list, ctx: dict) -> None:
+    """Inject the REAL platform config values into the compose step's overrides.
+
+    `platform.*` is platform-injected runtime config (the project's lakeFS repo,
+    the MLflow endpoint, the checkpoint bucket) — never a developer knob, never
+    committed to a repo. The template vendors a PLACEHOLDER copy of the group so
+    `python -m kubecore.compose` works on a laptop, and that copy is baked into
+    the compose step's image.
+
+    In the cluster the placeholder must lose. Without this the composed params
+    carried `platform.lakefs.repository: PLACEHOLDER-repo`, so config-validation
+    dutifully checked `s3://PLACEHOLDER-repo/...` and every run died on a lakeFS
+    ListObjectsV2 error (live 2026-07-16).
+
+    These go in as plain Hydra override tokens, FIRST, so a developer's own
+    tokens still apply afterwards and the `platform.*` guard on the ADVANCED
+    user YAML (compose.py) still refuses user edits to this group.
+    """
+    compose = next((s for s in steps if s["name"] == "compose-and-validate"), None)
+    if compose is None:
+        return  # a pipeline without the compose step — nothing to inject
+
+    checkpoints = ctx.get("checkpoints") or {}
+    overrides = {
+        "platform.lakefs.repository": ctx["lakefs"]["repository"],
+        "platform.lakefs.endpoint": ctx["lakefs"]["endpoint"],
+        "platform.mlflow.tracking_uri": ctx["mlflow"]["trackingUri"],
+    }
+    if checkpoints.get("bucket"):
+        overrides["platform.checkpoints.bucket"] = checkpoints["bucket"]
+    if checkpoints.get("prefix"):
+        overrides["platform.checkpoints.prefix"] = checkpoints["prefix"]
+
+    args = compose["container"].setdefault("args", [])
+    existing = {a.split("=", 1)[0] for a in args if isinstance(a, str)}
+    tokens = [f"{k}={v}" for k, v in overrides.items() if k not in existing and v]
+    compose["container"]["args"] = tokens + args
+
+
 def enhance_pipeline_info(spec: dict, ctx: dict, steps: list) -> None:
     """Read-only documentation parameter, first in the form (like the
     live WFT's pipeline-info)."""
@@ -532,8 +661,12 @@ def enhance(wft: dict, ctx: dict, catalog: dict = None) -> dict:
         compute_class = resolve_compute_class(step, ctx, annots)
         enhance_sizing_knobs(spec, step, compute_class)  # before scheduling fill
         enhance_scheduling(step, ctx, annots)
+        # After scheduling fill, so the final requests (developer-set or
+        # platform whole-node) are what get checked against the class budget.
+        validate_scheduling(step, compute_class)
         enhance_volumes(step, annots)
     enhance_workspace_pvc(spec, steps)
+    enhance_platform_group(steps, ctx)
     enhance_dynamic_enums(spec, ctx, catalog or {})
     enhance_pipeline_info(spec, ctx, steps)
     return wft

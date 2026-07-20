@@ -1,4 +1,4 @@
-# merge → main: build every step image and report a per-step status check.
+# merge → dev: build every step image and report a per-step status check.
 #
 # The AUTHORITATIVE build (kaniko → the in-cluster Zot registry, wired into the
 # WorkflowTemplate as image-<step>) is done by the platform's in-cluster CI
@@ -9,17 +9,19 @@
 #
 # The matrix is discovered at runtime by walking steps/*/Dockerfile, so a step
 # you add gets its own build + status check automatically — no edits here.
-name: main — build step images
+name: dev — build step images
 
 on:
   push:
-    # The template repo uses `main`; a seeded ML app's CI branch is typically
-    # `dev`. Build (and emit per-step status) on a push to either.
-    branches: [main, dev]
+    # dev only — the ML SDLC is dev-only. `main` holds the template's seeded
+    # content and is never developed against, so building it would report status
+    # for a branch the platform does not release from.
+    branches: [dev]
 
 permissions:
   contents: read
-  statuses: write   # one commit status per step
+  statuses: write      # one commit status per step
+  deployments: write   # one GitHub Deployment per merge (the run's rollup)
 
 jobs:
   # Discover the steps -> a build matrix. Adding steps/<name>/Dockerfile is all
@@ -28,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       steps: ${{ steps.find.outputs.steps }}
+      deployment_id: ${{ steps.deploy.outputs.result }}
     steps:
       - uses: actions/checkout@v4
       - id: find
@@ -44,6 +47,36 @@ jobs:
                   steps.append({"dir": d, "name": d.replace("_", "-")})
           print("steps=" + json.dumps(steps))
           PY
+
+      # One GitHub Deployment per merge, per app: the rollup a human reads.
+      # Per-step commit statuses answer "which step broke?"; this answers "is the
+      # app's image set healthy right now?" and shows in the repo's Environments
+      # timeline as pending (orange) -> success (green) / failure (red).
+      - id: deploy
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const steps = JSON.parse(process.env.STEPS || '[]');
+            const {data: d} = await github.rest.repos.createDeployment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'ml-images',
+              description: `step images for ${context.sha.substring(0,7)}`,
+              auto_merge: false,            // do not let GitHub retarget the ref
+              required_contexts: [],        // we are the check, do not wait on one
+              payload: {steps: steps.map(s => s.name), commit: context.sha},
+              transient_environment: false,
+            });
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              deployment_id: d.id, state: 'in_progress',
+              description: `building ${steps.length} step image(s)`,
+              log_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            return String(d.id);
+        env:
+          STEPS: ${{ steps.find.outputs.steps }}
 
   build:
     needs: discover
@@ -90,3 +123,36 @@ jobs:
               description: ok ? 'step image built' : 'step image build FAILED',
             });
             if (!ok) core.setFailed('build failed for ${{ matrix.step.name }}');
+
+  # Close the deployment. Runs with if: always() so a failed matrix still moves
+  # the environment off "in_progress" — a deployment stuck orange forever is
+  # worse than a red one, because nothing tells the developer it is over.
+  finalize:
+    needs: [discover, build]
+    if: always() && needs.discover.outputs.deployment_id != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const buildResult = '${{ needs.build.result }}';   // success | failure | cancelled | skipped
+            // skipped = the matrix was empty (no steps/*/Dockerfile), which is a
+            // legitimate no-op, not a failure. Only a real build failure is red.
+            const state = (buildResult === 'success' || buildResult === 'skipped') ? 'success'
+                        : buildResult === 'cancelled' ? 'inactive'
+                        : 'failure';
+            const steps = JSON.parse(process.env.STEPS || '[]').map(s => s.name);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const desc = buildResult === 'skipped'
+              ? 'no step images to build (no steps/*/Dockerfile changed)'
+              : state === 'success'
+              ? `${steps.length} step image(s) built: ${steps.join(', ')}`.substring(0, 140)
+              : `image build ${buildResult} — see the per-step build/* checks`;
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              deployment_id: Number('${{ needs.discover.outputs.deployment_id }}'),
+              state, description: desc, log_url: runUrl,
+              environment_url: runUrl,
+            });
+        env:
+          STEPS: ${{ needs.discover.outputs.steps }}
