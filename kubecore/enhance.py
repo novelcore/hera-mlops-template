@@ -346,6 +346,19 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
         "platform.kubecore.io/nodegroup-type", selector_value
     )
 
+    # PRD-858: an ml-environment-targeted app pins EVERY step onto that
+    # environment's own scale-to-zero class pools — the nodeSelector gains the
+    # environment label and the tolerations gain the kubenv env-exclusivity
+    # taint, mirroring exactly what kubenv-gcp stamps on those pools. Absent
+    # mlEnvironment (legacy project-wide apps) leaves output byte-for-byte
+    # unchanged. Same fill-absent discipline as everything else here.
+    ml_env = ctx.get("mlEnvironment") or {}
+    ml_env_name = (ml_env.get("name") or "").strip()
+    if ml_env_name:
+        step["nodeSelector"].setdefault(
+            "platform.kubecore.io/environment", ml_env_name
+        )
+
     # Bound how long this step may sit unschedulable (see the constants above).
     # fill-absent: a developer who set their own deadline keeps it.
     step.setdefault(
@@ -367,6 +380,19 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
     if gpu and not any(t.get("key") == "nvidia.com/gpu" for t in tolerations):
         # GKE auto-taints accelerator nodes; tolerate it so the pod schedules.
         tolerations.append({"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"})
+    if ml_env_name and not any(
+        t.get("key") == "platform.kubecore.io/kubenv" for t in tolerations
+    ):
+        # PRD-858: the env pools carry the kubenv env-exclusivity taint;
+        # without this toleration every step Pends forever on its own pools.
+        tolerations.append(
+            {
+                "key": "platform.kubecore.io/kubenv",
+                "operator": "Equal",
+                "value": ml_env_name,
+                "effect": "NoSchedule",
+            }
+        )
 
     # Sizing. Developer-set requests always win; a missing limit mirrors the
     # (possibly developer-set) request. Only fields the developer left entirely
