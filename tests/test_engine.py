@@ -217,14 +217,77 @@ def test_nodeselector_uses_step_class():
 
 
 def test_gpu_routing():
+    """#865 contract: gpu-capable steps are CLASS-ROUTABLE at submit time.
+
+    The typed nvidia.com/gpu request is gone; the GPU quantity lives in the
+    podSpecPatch keyed to a `gpus` input, and every DAG task invoking the
+    step derives gpus from the {step}-class param via an {{=}} expression.
+    """
     wft = _enhanced()
-    gpu_steps = set()
+    gpu_steps, typed_gpu = set(), set()
     for t in wft["spec"]["templates"]:
-        if "container" in t:
-            req = t["container"].get("resources", {}).get("requests", {})
-            if "nvidia.com/gpu" in req:
-                gpu_steps.add(t["name"])
+        if "container" not in t:
+            continue
+        req = t["container"].get("resources", {}).get("requests", {})
+        if "nvidia.com/gpu" in req:
+            typed_gpu.add(t["name"])
+        patch = t.get("podSpecPatch", "")
+        if "nvidia.com/gpu" in patch:
+            assert "{{inputs.parameters.gpus}}" in patch, (
+                f"{t['name']}: GPU quantity in patch must be the gpus input"
+            )
+            names = [p["name"] for p in t.get("inputs", {}).get("parameters", [])]
+            assert "gpus" in names, f"{t['name']}: missing gpus input parameter"
+            gpu_steps.add(t["name"])
+    assert typed_gpu == set(), f"typed GPU requests must be routed, not static: {typed_gpu}"
     assert gpu_steps == {"model-training", "qat-finetune"}, f"unexpected GPU steps: {gpu_steps}"
+
+    # DAG tasks pass gpus via the {{=}} class-mapping expression.
+    for t in wft["spec"]["templates"]:
+        for task in (t.get("dag", {}) or {}).get("tasks", []):
+            if task.get("template") in gpu_steps:
+                params = {p["name"]: p.get("value", "") for p in task.get("arguments", {}).get("parameters", [])}
+                assert "gpus" in params, f"task {task['name']}: missing gpus argument"
+                expr = params["gpus"]
+                assert expr.startswith("{{=") and f"{task['template']}-class" in expr, (
+                    f"task {task['name']}: gpus must derive from the class param, got {expr!r}"
+                )
+
+
+def test_class_param_always_a_dropdown_with_full_catalog():
+    """#865 fix 1: {step}-class always carries an enum (never a free-text
+    box), and the enum spans the FULL pool catalog, all tiers."""
+    wft = _enhanced()
+    all_names = {c["name"] for c in CONTEXT["computeClasses"]["all"]}
+    found = 0
+    for p in wft["spec"]["arguments"]["parameters"]:
+        if not p["name"].endswith("-class"):
+            continue
+        found += 1
+        assert "enum" in p, f"{p['name']}: no enum — renders as free text"
+        assert set(p["enum"]) >= all_names, (
+            f"{p['name']}: enum {p['enum']} does not span the catalog {all_names}"
+        )
+        assert p["value"] in p["enum"], f"{p['name']}: default not among options"
+    assert found, "no {step}-class parameters rendered at all"
+
+
+def test_steps_tolerate_every_catalog_class():
+    """#865: tolerations render statically but the class routes at submit
+    time — every routable step must tolerate every catalog class's taint."""
+    wft = _enhanced()
+    want = set()
+    for c in CONTEXT["computeClasses"]["all"]:
+        tier = CONTEXT["computeClasses"].get(c.get("tier", "cpu"), {})
+        merged = {**tier, **c}
+        if merged.get("tolerationKey"):
+            want.add((merged["tolerationKey"], merged["tolerationValue"]))
+    for t in wft["spec"]["templates"]:
+        if "container" not in t:
+            continue
+        have = {(x.get("key"), x.get("value")) for x in t.get("tolerations", [])}
+        missing = want - have
+        assert not missing, f"{t['name']}: missing class tolerations {missing}"
 
 
 def test_image_indirection_uses_app_configmap():
