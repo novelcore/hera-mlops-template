@@ -241,6 +241,108 @@ def resolve_compute_class(step: dict, ctx: dict, annots: dict) -> dict:
     return ctx["computeClasses"]["gpu" if is_gpu_step(step) else "cpu"]
 
 
+def catalog_toleration_pairs(ctx: dict, step: dict, annots: dict) -> list:
+    """Unique (tolerationKey, tolerationValue) pairs a step must tolerate.
+
+    A pinned (compute-class annotation) step tolerates only its pinned
+    class's taint — it can never be routed elsewhere. Every other step
+    tolerates the FULL catalog (#865): the {step}-class dropdown may route
+    it onto any class pool at submit time, and tolerations render statically.
+    """
+    classes = list(ctx["computeClasses"]["all"])
+    if "compute-class" in annots:
+        classes = [c for c in classes if c["name"] == annots["compute-class"]] or classes
+    pairs = []
+    for cls in classes:
+        tier_default = ctx["computeClasses"].get(cls.get("tier", "cpu"), {})
+        merged = {**tier_default, **cls}
+        pair = (merged.get("tolerationKey"), merged.get("tolerationValue"))
+        if pair[0] and pair not in pairs:
+            pairs.append(pair)
+    return pairs
+
+
+def gpu_class_names(ctx: dict) -> list:
+    """Names of every gpu-tier class in the pool catalog (dedup, ordered)."""
+    names = [c["name"] for c in ctx["computeClasses"]["all"] if c.get("tier") == "gpu"]
+    tier_default = ctx["computeClasses"].get("gpu", {}).get("name")
+    if tier_default and tier_default not in names:
+        names.insert(0, tier_default)
+    return names
+
+
+def enhance_gpu_routing(spec: dict, step: dict, ctx: dict, annots: dict) -> None:
+    """Make a gpu-declaring step class-routable at submit time (#865 fix 2).
+
+    A gpu=True step used to carry a STATIC nvidia.com/gpu request +
+    GPU-only scheduling, so submitting {step}-class=<cpu class> produced a
+    pod that targets a CPU node while requesting a GPU — permanently
+    Unschedulable. CPU smoke tests and PTQ-on-CPU (routine on the kubeline
+    template, which had separate cpu/gpu step variants) were impossible.
+
+    Mechanics — static render, runtime routing, using only PROVEN eval
+    sites (the platform's podSpecPatch sizing model + {{=}} in DAG task
+    arguments, the one expression site Argo reliably evaluates):
+      1. strip the developer's typed nvidia.com/gpu request/limit (it stays
+         the gpu-capability DECLARATION, detected before this runs);
+      2. give the template a `gpus` input (default "1" — direct invocation
+         keeps GPU behavior);
+      3. extend the sizing podSpecPatch with nvidia.com/gpu:
+         "{{inputs.parameters.gpus}}" under requests+limits — a "0" request
+         for an extended resource is ignored by the scheduler, so the pod
+         lands on CPU nodes;
+      4. every DAG task invoking this step passes gpus via an {{=}}
+         expression mapping the {step}-class param to '1' iff it names a
+         gpu-tier class.
+
+    Pinned (compute-class annotation) steps are untouched: their class is a
+    render-time constant, and enhance_scheduling keeps the static request.
+    """
+    if "compute-class" in annots or not is_gpu_step(step):
+        return
+    step_name = step["name"]
+
+    # 1. The typed request was the capability declaration; routing owns it now.
+    resources = step["container"].get("resources", {})
+    resources.get("requests", {}).pop("nvidia.com/gpu", None)
+    resources.get("limits", {}).pop("nvidia.com/gpu", None)
+
+    # 2. Template input with a GPU-preserving default.
+    inputs = step.setdefault("inputs", {})
+    input_params = inputs.setdefault("parameters", [])
+    if not any(p.get("name") == "gpus" for p in input_params):
+        input_params.append({"name": "gpus", "default": "1"})
+
+    # 3. Extend the sizing patch (enhance_sizing_knobs ran first and always
+    #    sets it) with the parameterized GPU quantity — YAML-level merge into
+    #    the same `main` container entry, never a second patch document.
+    patch_obj = yaml.safe_load(step.get("podSpecPatch") or "") or {}
+    containers = patch_obj.setdefault("containers", [])
+    main = next((c for c in containers if c.get("name") == "main"), None)
+    if main is None:
+        main = {"name": "main"}
+        containers.append(main)
+    res = main.setdefault("resources", {})
+    res.setdefault("requests", {})["nvidia.com/gpu"] = "{{inputs.parameters.gpus}}"
+    res.setdefault("limits", {})["nvidia.com/gpu"] = "{{inputs.parameters.gpus}}"
+    step["podSpecPatch"] = yaml.safe_dump(patch_obj, default_flow_style=False)
+
+    # 4. DAG tasks pass gpus from the class param.
+    gpu_names = gpu_class_names(ctx)
+    expr_list = ", ".join(f"'{n}'" for n in gpu_names)
+    expr = (
+        f"{{{{=workflow.parameters['{step_name}-class'] in [{expr_list}] ? '1' : '0'}}}}"
+    )
+    for template in spec["templates"]:
+        for task in (template.get("dag", {}) or {}).get("tasks", []):
+            if task.get("template") != step_name:
+                continue
+            args = task.setdefault("arguments", {})
+            params = args.setdefault("parameters", [])
+            if not any(p.get("name") == "gpus" for p in params):
+                params.append({"name": "gpus", "value": expr})
+
+
 def enhance_class_param(spec: dict, step: dict, ctx: dict, annots: dict) -> None:
     """Per-step compute-class dropdown ({step}-class), matching the live WFT.
 
@@ -257,17 +359,24 @@ def enhance_class_param(spec: dict, step: dict, ctx: dict, annots: dict) -> None
         return
     tier = "gpu" if is_gpu_step(step) else "cpu"
     default = ctx["computeClasses"][tier]["name"]
-    options = [c["name"] for c in ctx["computeClasses"]["all"] if c.get("tier") == tier]
+    # Full pool catalog, ALL tiers, ALWAYS attached (#865): the old
+    # tier-filtered list collapsed to length 1 on a one-class-per-tier pool,
+    # and enum-only-when->1 then rendered a FREE-TEXT box (typo -> forever-
+    # Pending run). Cross-tier entries are legitimate choices: a gpu-capable
+    # step submitted with a cpu class runs CPU-only (see the gpus routing in
+    # enhance_gpu_routing).
+    options = [c["name"] for c in ctx["computeClasses"]["all"]]
+    if default not in options:
+        options.insert(0, default)
     param = {
         "name": param_name,
         "value": default,
+        "enum": options,
         "description": (
             f"Compute class for the '{step_name}' step "
-            f"(the KubePool's allowed {tier} classes)."
+            f"(the KubePool's class catalog; default = its {tier} tier)."
         ),
     }
-    if len(options) > 1:
-        param["enum"] = options
     parameters.append(param)
 
 
@@ -367,18 +476,23 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
     )
 
     tolerations = step.setdefault("tolerations", [])
-    toleration_key = compute_class["tolerationKey"]
-    if not any(t.get("key") == toleration_key for t in tolerations):
-        tolerations.append(
-            {
-                "key": toleration_key,
-                "operator": "Equal",
-                "value": compute_class["tolerationValue"],
-                "effect": "NoSchedule",
-            }
-        )
+    # Tolerate EVERY catalog class's taint, not just the default class's
+    # (#865): the {step}-class dropdown routes at SUBMIT time via the
+    # nodeSelector param, but tolerations are rendered statically — a run
+    # submitted onto any non-default class (including cross-tier) must
+    # already tolerate that pool's taint or it Pends forever. Tolerations
+    # are permissive; the nodeSelector still pins the exact pool.
+    for pair in catalog_toleration_pairs(ctx, step, annots):
+        key, value = pair
+        if not any(
+            t.get("key") == key and t.get("value") == value for t in tolerations
+        ):
+            tolerations.append(
+                {"key": key, "operator": "Equal", "value": value, "effect": "NoSchedule"}
+            )
     if gpu and not any(t.get("key") == "nvidia.com/gpu" for t in tolerations):
         # GKE auto-taints accelerator nodes; tolerate it so the pod schedules.
+        # Harmless on CPU nodes (tolerations never attract, only permit).
         tolerations.append({"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"})
     if ml_env_name and not any(
         t.get("key") == "platform.kubecore.io/kubenv" for t in tolerations
@@ -405,7 +519,14 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
     for field_name, default in defaults.items():
         requests.setdefault(field_name, default)
         limits.setdefault(field_name, requests[field_name])  # limits follow requests
-    if gpu:
+    # NOTE (#865): the GPU request is deliberately NOT set here for
+    # class-routable steps — enhance_gpu_routing moves it into the
+    # podSpecPatch keyed to the runtime class choice, so a gpu-capable step
+    # submitted with a cpu class carries nvidia.com/gpu: "0" (which the
+    # scheduler ignores) instead of an unsatisfiable GPU request on a CPU
+    # node. Pinned (compute-class annotation) gpu steps keep the static
+    # request: their class never changes at submit time.
+    if gpu and "compute-class" in annots:
         requests.setdefault("nvidia.com/gpu", "1")
         limits.setdefault("nvidia.com/gpu", "1")
 
@@ -433,7 +554,7 @@ def _parse_mem_gib(value) -> float:
     return float(text) / 1024**3  # bare bytes
 
 
-def validate_scheduling(step: dict, compute_class: dict) -> None:
+def validate_scheduling(step: dict, compute_class: dict, gpu: bool = None) -> None:
     """Fail the render if this step can NEVER schedule on its compute class.
 
     The step's requests are compared against the class's whole-node budget
@@ -471,7 +592,7 @@ def validate_scheduling(step: dict, compute_class: dict) -> None:
                 f"'{class_name}' ({machine}) can only give a pod {allocatable['memoryGiB']}Gi — "
                 f"the pod would never schedule. Lower the request or pick a bigger class."
             )
-    if is_gpu_step(step) and not compute_class.get("guestAccelerator"):
+    if (is_gpu_step(step) if gpu is None else gpu) and not compute_class.get("guestAccelerator"):
         raise EnhanceError(
             f"step '{step_name}' requests a GPU but compute class '{class_name}' "
             f"({machine}) has no accelerator — the pod would never schedule."
@@ -681,6 +802,9 @@ def enhance(wft: dict, ctx: dict, catalog: dict = None) -> dict:
     enhance_arguments(spec, ctx, steps)
     for step in steps:
         annots = platform_annotations(step)  # validates; raises on unknown keys
+        # Captured BEFORE enhance_gpu_routing strips the typed request — the
+        # developer's nvidia.com/gpu declaration is the capability marker.
+        gpu = is_gpu_step(step)
         enhance_image(step, ctx, annots)
         enhance_env(step, ctx, annots)
         enhance_class_param(spec, step, ctx, annots)
@@ -689,7 +813,11 @@ def enhance(wft: dict, ctx: dict, catalog: dict = None) -> dict:
         enhance_scheduling(step, ctx, annots)
         # After scheduling fill, so the final requests (developer-set or
         # platform whole-node) are what get checked against the class budget.
-        validate_scheduling(step, compute_class)
+        validate_scheduling(step, compute_class, gpu)
+        # After validation: strips the typed GPU request and installs the
+        # runtime class->gpus routing (#865), so the checks above still saw
+        # the full gpu-tier picture.
+        enhance_gpu_routing(spec, step, ctx, annots)
         enhance_volumes(step, annots)
     enhance_workspace_pvc(spec, steps)
     enhance_platform_group(steps, ctx)
