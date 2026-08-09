@@ -47,17 +47,70 @@ class ComposeError(Exception):
     pass
 
 
+def _normalize_override_token(token: str) -> str:
+    """Strip surrounding whitespace/control chars off an override token.
+
+    Submitted form values travel UI -> Argo parameter -> argv, and that
+    plumbing can attach a trailing CR/newline/space the submitter cannot see.
+    A trailing '\\r' makes Hydra's override lexer throw
+    LexerNoViableAltException on a perfectly ordinary token — live #867:
+    `train.epochs=3\\r` failed EVERY numeric-tuning run with the caret
+    pointing one past the digit. Surrounding whitespace is never semantic in
+    a key=value token, so strip it from both the whole token and the value.
+    """
+    token = token.strip()
+    key, sep, value = token.partition("=")
+    if not sep:
+        return token
+    return f"{key.strip()}={value.strip()}"
+
+
+def _quote_override_value(token: str) -> str:
+    """Quote a scalar override's value so Hydra's override grammar accepts it.
+
+    Form values reach us as `key=value` tokens. Hydra's override parser rejects
+    a bare value containing a space or various special characters (a
+    `LexerNoViableAltException`) — so a perfectly ordinary config string like
+    `label=📊 Data summary` or `name=my run` would fail compose. Wrap the value
+    in double quotes (escaping any it contains) unless it is already quoted or
+    is a simple bare token Hydra parses fine. Group tokens (key contains '/')
+    and the key itself are left untouched.
+
+    HISTORY (#867): this helper originally shipped only as a hotfix on an
+    app's VENDORED copy and was lost when the app re-synced to template HEAD
+    — it lives here now so the template is the single source of truth.
+    """
+    key, sep, value = token.partition("=")
+    if not sep or "/" in key:
+        return token  # not a scalar leaf assignment (or a group swap)
+    if value == "" or (value[0] in "\"'" and value[-1] == value[0]):
+        return token  # empty, or already quoted
+    # Bare tokens Hydra accepts as-is: alphanumerics, dot, underscore, hyphen,
+    # plus/at/colon/slash for paths — anything else (space, emoji, punctuation)
+    # needs quoting.
+    import re
+    if re.fullmatch(r"[A-Za-z0-9._+@:/\-]*", value):
+        return token
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'{key}="{escaped}"'
+
+
 def order_overrides(overrides: list, render_defaults: dict) -> list:
-    """Groups first; untouched scalar leaves elided (see module docstring)."""
+    """Groups first; untouched scalar leaves elided (see module docstring).
+
+    Tokens are whitespace-normalized first (#867: invisible trailing CR from
+    the submit plumbing), then changed scalar values are quoted so Hydra
+    accepts strings with spaces / special characters."""
     groups, changed = [], []
     for token in overrides:
+        token = _normalize_override_token(token)
         key, _, value = token.partition("=")
         if "/" in key:
             groups.append(token)
         elif render_defaults and key in render_defaults and value == render_defaults[key]:
             continue  # untouched -> follows the selected group
         else:
-            changed.append(token)
+            changed.append(_quote_override_value(token))
     return groups + changed
 
 

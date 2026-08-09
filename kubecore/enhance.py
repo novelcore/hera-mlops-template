@@ -63,6 +63,9 @@ import yaml
 ANNOTATION_PREFIX = "platform.kubecore.io/"
 KNOWN_ANNOTATIONS = {"compute-class", "inject", "source", "image", "shm", "workspace", "hpc"}
 WORKSPACE_MOUNT = "/workspace"
+# Mount path for the Zitadel machine-key secret backing MLflow bearer auth
+# (#868) — matches kubeline's working reference (/etc/mlflow-svc).
+MLFLOW_SVC_MOUNT = "/etc/mlflow-svc"
 
 
 class EnhanceError(Exception):
@@ -403,6 +406,22 @@ def enhance_env(step: dict, ctx: dict, annots: dict) -> None:
 
     if not inject_disabled(annots, "mlflow"):
         add({"name": "MLFLOW_TRACKING_URI", "value": ctx["mlflow"]["trackingUri"]})
+        # MLflow AUTH (#868): the tracking server sits behind mlflow-oidc-auth,
+        # so a bare MLFLOW_TRACKING_URI 401s on any real logging/registry call.
+        # Mirror kubeline's working reference: the step mints a Zitadel machine
+        # JWT from the key file (mounted by enhance_volumes from
+        # mlflow.svcSecret) and sends it as the bearer. Injected only when the
+        # context carries the OIDC coordinates — a context without them (OIDC
+        # off) keeps today's env exactly.
+        mlflow_ctx = ctx.get("mlflow") or {}
+        oidc_domain = (mlflow_ctx.get("oidcDomain") or "").strip()
+        oidc_project = (mlflow_ctx.get("oidcProjectId") or "").strip()
+        if oidc_domain and oidc_project and (mlflow_ctx.get("svcSecret") or "").strip():
+            add({"name": "MLFLOW_TRACKING_AUTH", "value": "zitadel"})
+            add({"name": "ZITADEL_DOMAIN", "value": oidc_domain})
+            add({"name": "ZITADEL_MLFLOW_PROJECT_ID", "value": oidc_project})
+            add({"name": "ZITADEL_MACHINE_KEY_FILE",
+                 "value": f"{MLFLOW_SVC_MOUNT}/ZITADEL_MACHINE_KEY"})
     if not inject_disabled(annots, "lakefs"):
         add({"name": "LAKEFS_ENDPOINT", "value": ctx["lakefs"]["endpoint"]})
         keys = ctx["lakefs"]["adminSecretKeys"]
@@ -651,15 +670,38 @@ def enhance_sizing_knobs(spec: dict, step: dict, compute_class: dict) -> None:
 # ------------------------------------------------------------------- volumes
 
 
-def enhance_volumes(step: dict, annots: dict) -> None:
-    """Inject /dev/shm (sizable via shm annotation) and, opt-in, a per-run
-    RWO workspace PVC (workspace annotation). Raw developer volumes win
+def enhance_volumes(step: dict, annots: dict, ctx: dict = None) -> None:
+    """Inject /dev/shm (sizable via shm annotation), opt-in per-run RWO
+    workspace PVC (workspace annotation), and — when the context carries the
+    MLflow OIDC coordinates (#868) — the Zitadel machine-key secret mount the
+    MLflow auth env from enhance_env points at. Raw developer volumes win
     (only-fill-absent)."""
     container = step["container"]
     volume_mounts = container.setdefault("volumeMounts", [])
     mounted = {m.get("mountPath") for m in volume_mounts}
     volumes = step.setdefault("volumes", [])
     vol_names = {v.get("name") for v in volumes}
+
+    # MLflow Zitadel machine key (#868) — same gating as the env injection in
+    # enhance_env: only when the context has domain + project id + secret, and
+    # the developer hasn't opted the step out of mlflow injection.
+    mlflow_ctx = (ctx or {}).get("mlflow") or {}
+    if (
+        not inject_disabled(annots, "mlflow")
+        and (mlflow_ctx.get("oidcDomain") or "").strip()
+        and (mlflow_ctx.get("oidcProjectId") or "").strip()
+        and (mlflow_ctx.get("svcSecret") or "").strip()
+        and MLFLOW_SVC_MOUNT not in mounted
+    ):
+        if "mlflow-svc" not in vol_names:
+            volumes.append({
+                "name": "mlflow-svc",
+                "secret": {"secretName": mlflow_ctx["svcSecret"].strip()},
+            })
+        volume_mounts.append({
+            "name": "mlflow-svc", "mountPath": MLFLOW_SVC_MOUNT, "readOnly": True,
+        })
+        mounted.add(MLFLOW_SVC_MOUNT)
 
     # /dev/shm — PyTorch dataloader shared memory. Default 1Gi; shm annotation
     # overrides. Only if the developer didn't already mount /dev/shm.
@@ -818,7 +860,7 @@ def enhance(wft: dict, ctx: dict, catalog: dict = None) -> dict:
         # runtime class->gpus routing (#865), so the checks above still saw
         # the full gpu-tier picture.
         enhance_gpu_routing(spec, step, ctx, annots)
-        enhance_volumes(step, annots)
+        enhance_volumes(step, annots, ctx)
     enhance_workspace_pvc(spec, steps)
     enhance_platform_group(steps, ctx)
     enhance_dynamic_enums(spec, ctx, catalog or {})
