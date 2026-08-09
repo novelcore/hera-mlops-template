@@ -426,3 +426,52 @@ if __name__ == "__main__":
                 print(f"FAIL {name}: {e}")
     print(f"\n{'ALL PASS' if not failures else f'{failures} FAILURES'}")
     sys.exit(1 if failures else 0)
+
+def test_override_tokens_survive_submit_plumbing_artifacts():
+    """#867: invisible trailing CR/newline/space on a submitted value must not
+    kill the Hydra lexer (live: train.epochs=3\\r failed every tuning run),
+    and special-char values (spaces, emoji) must compose via quoting."""
+    from kubecore.compose import compose_and_validate
+    # trailing CR (the live #867 shape), trailing newline, padded value
+    for tok in ["train.epochs=3\r", "train.epochs=3\n", " train.epochs=3 ", "train.epochs= 3"]:
+        text = compose_and_validate([tok], "", [], {})
+        assert "epochs: 3" in text, f"token {tok!r} did not compose to epochs: 3"
+    # special characters need quoting, not rejection
+    text = compose_and_validate(["experiment.description=my smoke run 📊"], "", [], {})
+    assert "my smoke run" in text
+    # group swaps and bare tokens stay untouched
+    from kubecore.compose import order_overrides, _quote_override_value
+    assert order_overrides(["train/qat=disabled"], {}) == ["train/qat=disabled"]
+    assert _quote_override_value("data.ref=main") == "data.ref=main"
+
+def test_mlflow_zitadel_auth_injected_into_steps():
+    """#868: steps get the full MLflow bearer-auth wiring (kubeline parity) —
+    env vars + machine-key secret mount — when the context carries the OIDC
+    coordinates; a context without them (OIDC off) leaves the env untouched."""
+    import copy
+    wft = _enhanced()
+    for t in wft["spec"]["templates"]:
+        if "container" not in t:
+            continue
+        env = {e["name"]: e.get("value") for e in t["container"].get("env", [])}
+        assert env.get("MLFLOW_TRACKING_AUTH") == "zitadel", t["name"]
+        assert env.get("ZITADEL_DOMAIN") == CONTEXT["mlflow"]["oidcDomain"], t["name"]
+        assert env.get("ZITADEL_MLFLOW_PROJECT_ID") == CONTEXT["mlflow"]["oidcProjectId"], t["name"]
+        assert env.get("ZITADEL_MACHINE_KEY_FILE") == "/etc/mlflow-svc/ZITADEL_MACHINE_KEY", t["name"]
+        mounts = {m["mountPath"]: m for m in t["container"].get("volumeMounts", [])}
+        assert "/etc/mlflow-svc" in mounts and mounts["/etc/mlflow-svc"].get("readOnly"), t["name"]
+        vols = {v["name"]: v for v in t.get("volumes", [])}
+        assert vols.get("mlflow-svc", {}).get("secret", {}).get("secretName") == CONTEXT["mlflow"]["svcSecret"], t["name"]
+
+    # OIDC off (empty coordinates, the pre-fix env-targeted context shape):
+    # no auth env, no mount — byte-parity with today.
+    ctx = copy.deepcopy(CONTEXT)
+    ctx["mlflow"]["oidcDomain"] = ""
+    ctx["mlflow"]["oidcProjectId"] = ""
+    wft2 = enhance.enhance(_render(), ctx, CATALOG)
+    for t in wft2["spec"]["templates"]:
+        if "container" not in t:
+            continue
+        env = {e["name"] for e in t["container"].get("env", [])}
+        assert "MLFLOW_TRACKING_AUTH" not in env, t["name"]
+        assert not any(m["mountPath"] == "/etc/mlflow-svc" for m in t["container"].get("volumeMounts", [])), t["name"]
