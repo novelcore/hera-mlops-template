@@ -5,7 +5,7 @@ and a platform context (pipeline-context.yaml, sourced from the
 `{app}-pipeline-context` ConfigMap the operator writes into the app namespace)
 and injects everything the developer never had to think about: namespace,
 service account, secrets, compute-class routing, node scheduling, image
-supply-chain wiring, per-run sizing knobs ({step}-cpu/{step}-mem via
+supply-chain wiring, per-run sizing knobs ({step}-cpu/{step}-mem/{step}-disk via
 podSpecPatch), per-step compute-class dropdowns ({step}-class, matching the
 live render-wft), dynamic enum dropdowns (compute classes from the pool,
 dataset refs from the dataset-catalog probe), and the read-only pipeline-info
@@ -538,6 +538,9 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
     for field_name, default in defaults.items():
         requests.setdefault(field_name, default)
         limits.setdefault(field_name, requests[field_name])  # limits follow requests
+    # Disk request floor (#892) — request only, deliberately NO limit (see
+    # DISK_REQUEST_DEFAULT): kubeline-parity eviction shield for every step.
+    requests.setdefault("ephemeral-storage", DISK_REQUEST_DEFAULT)
     # NOTE (#865): the GPU request is deliberately NOT set here for
     # class-routable steps — enhance_gpu_routing moves it into the
     # podSpecPatch keyed to the runtime class choice, so a gpu-capable step
@@ -611,6 +614,15 @@ def validate_scheduling(step: dict, compute_class: dict, gpu: bool = None) -> No
                 f"'{class_name}' ({machine}) can only give a pod {allocatable['memoryGiB']}Gi — "
                 f"the pod would never schedule. Lower the request or pick a bigger class."
             )
+    disk_size_gb = compute_class.get("diskSizeGb")
+    if "ephemeral-storage" in requests and disk_size_gb:
+        want = _parse_mem_gib(requests["ephemeral-storage"])
+        if want > disk_size_gb:
+            raise EnhanceError(
+                f"step '{step_name}' requests {requests['ephemeral-storage']} ephemeral-storage "
+                f"but compute class '{class_name}' ({machine}) has only a {disk_size_gb}GB boot "
+                f"disk — the pod would never schedule. Lower disk= or pick a bigger class."
+            )
     if (is_gpu_step(step) if gpu is None else gpu) and not compute_class.get("guestAccelerator"):
         raise EnhanceError(
             f"step '{step_name}' requests a GPU but compute class '{class_name}' "
@@ -618,14 +630,26 @@ def validate_scheduling(step: dict, compute_class: dict, gpu: bool = None) -> No
         )
 
 
+# Ephemeral-storage baseline for every step (#892). Unlike cpu/mem there is
+# no whole-node "allocatable disk" in the class catalog, so the platform sets
+# a flat floor: kubeline requested 10Gi on its heavy steps (model-training,
+# model-quantization) and that proved sufficient; qat-class steps that need
+# more declare disk="20Gi" in pipeline.py. Request-only, never a limit: the
+# request is the eviction shield (a pod under its request is evicted LAST and
+# the scheduler won't place it on a nearly-full node); a limit would instead
+# kill legitimate spiky export scratch (onnx2tf temp trees).
+DISK_REQUEST_DEFAULT = "10Gi"
+
+
 def enhance_sizing_knobs(spec: dict, step: dict, compute_class: dict) -> None:
     """Per-run sizing knobs, mirroring the live WFT's podSpecPatch model.
 
-    Emits {step}-cpu / {step}-mem workflow parameters (defaults = the
-    developer-set requests when present, else the class's whole-node
-    allocatable) and wires them into the template via podSpecPatch so a
-    submitter can dial a single run down/up without re-rendering. The
-    developer writes nothing for this.
+    Emits {step}-cpu / {step}-mem / {step}-disk workflow parameters
+    (defaults = the developer-set requests when present, else the class's
+    whole-node allocatable for cpu/mem and DISK_REQUEST_DEFAULT for disk)
+    and wires them into the template via podSpecPatch so a submitter can
+    dial a single run down/up without re-rendering. The developer writes
+    nothing for this.
 
     MUST run before enhance_scheduling so "developer-set" can still be
     told apart from platform whole-node fill.
@@ -639,6 +663,7 @@ def enhance_sizing_knobs(spec: dict, step: dict, compute_class: dict) -> None:
     knobs = {
         f"{step_name}-cpu": str(dev_requests.get("cpu", allocatable["cpu"])),
         f"{step_name}-mem": str(dev_requests.get("memory", f"{allocatable['memoryGiB']}Gi")),
+        f"{step_name}-disk": str(dev_requests.get("ephemeral-storage", DISK_REQUEST_DEFAULT)),
     }
     for name, default in knobs.items():
         if name not in existing:
@@ -653,6 +678,7 @@ def enhance_sizing_knobs(spec: dict, step: dict, compute_class: dict) -> None:
             )
             existing.add(name)
 
+    # ephemeral-storage under requests only — see DISK_REQUEST_DEFAULT.
     patch = (
         "containers:\n"
         "- name: main\n"
@@ -660,6 +686,7 @@ def enhance_sizing_knobs(spec: dict, step: dict, compute_class: dict) -> None:
         "    requests:\n"
         f'      cpu: "{{{{workflow.parameters.{step_name}-cpu}}}}"\n'
         f'      memory: "{{{{workflow.parameters.{step_name}-mem}}}}"\n'
+        f'      ephemeral-storage: "{{{{workflow.parameters.{step_name}-disk}}}}"\n'
         "    limits:\n"
         f'      cpu: "{{{{workflow.parameters.{step_name}-cpu}}}}"\n'
         f'      memory: "{{{{workflow.parameters.{step_name}-mem}}}}"\n'

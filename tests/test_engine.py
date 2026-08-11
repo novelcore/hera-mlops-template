@@ -475,3 +475,60 @@ def test_mlflow_zitadel_auth_injected_into_steps():
         env = {e["name"] for e in t["container"].get("env", [])}
         assert "MLFLOW_TRACKING_AUTH" not in env, t["name"]
         assert not any(m["mountPath"] == "/etc/mlflow-svc" for m in t["container"].get("volumeMounts", [])), t["name"]
+
+
+def test_disk_sizing_knobs_and_requests():
+    """#892: every step gets an ephemeral-storage request + {step}-disk knob.
+
+    Request-only (never a limit): the request is the eviction shield; a limit
+    would kill spiky export scratch. A developer disk= knob becomes the knob
+    default; steps without it get the platform floor."""
+    wft = _enhanced()
+    params = {p["name"]: p for p in wft["spec"]["arguments"]["parameters"]}
+    # platform floor on a knob-less step; developer disk="20Gi" flows through
+    assert params["model-quantization-disk"]["value"] == enhance.DISK_REQUEST_DEFAULT
+    assert params["qat-finetune-disk"]["value"] == "20Gi"
+    for t in wft["spec"]["templates"]:
+        if "container" not in t or t["name"] == "compose-and-validate":
+            continue
+        name = t["name"]
+        assert f"{name}-disk" in params, f"{name}: missing -disk knob"
+        requests = t["container"]["resources"]["requests"]
+        limits = t["container"]["resources"].get("limits", {})
+        assert "ephemeral-storage" in requests, f"{name}: no static disk request"
+        assert "ephemeral-storage" not in limits, f"{name}: disk limit must not be set"
+        patch = yaml.safe_load(t["podSpecPatch"])
+        main = next(c for c in patch["containers"] if c["name"] == "main")
+        assert (
+            main["resources"]["requests"]["ephemeral-storage"]
+            == f"{{{{workflow.parameters.{name}-disk}}}}"
+        ), f"{name}: knob not wired into podSpecPatch requests"
+        assert "ephemeral-storage" not in main["resources"].get("limits", {}), (
+            f"{name}: knob must not set a disk limit"
+        )
+
+
+def test_disk_knob_rejects_bad_quantity():
+    from kubecore import authoring
+
+    with authoring.pipeline("bad-disk") as p:
+        try:
+            authoring.step("some-step", disk="10 gigs")
+            assert False, "disk='10 gigs' should fail authoring"
+        except authoring.AuthoringError as e:
+            assert "quantity" in str(e)
+        p.steps = []  # nothing valid was added; render nothing
+
+
+def test_disk_request_beyond_boot_disk_fails_render():
+    raw = _render()
+    for t in raw["spec"]["templates"]:
+        if "container" in t and t["name"] == "model-quantization":
+            t["container"].setdefault("resources", {}).setdefault("requests", {})[
+                "ephemeral-storage"] = "500Gi"
+            break
+    try:
+        enhance.enhance(raw, CONTEXT, CATALOG)
+        assert False, "500Gi disk on a 50GB boot-disk class should fail the render"
+    except enhance.EnhanceError as e:
+        assert "ephemeral-storage" in str(e) and "boot" in str(e)
