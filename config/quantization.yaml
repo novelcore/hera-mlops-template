@@ -5,4 +5,4 @@ quantization:
   calibration_seed: 42
   parity_frames: 100 # frames for the INT8 vs FP32 parity check
   parity_max_abs_error: 0.05 # run fails above this threshold
-  output_prefix: "quantization" # S3 key prefix for quantized artifacts
+  output_prefix: "main/quantization" # lakeFS «branch»/path — the first segment IS the branch (upload + commit target); a prefix without it resolves a nonexistent branch → NoSuchBucket (#896)
