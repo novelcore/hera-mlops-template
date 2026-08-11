@@ -13,6 +13,12 @@ compose-and-validate step as task 1:
   fed from compose's output — downstream steps NEVER see override tokens;
 - `gpu=True` -> `Resources(gpus=1)`, which is exactly what the enhancer
   detects for GPU scheduling;
+- `disk="20Gi"` -> an ephemeral-storage REQUEST (#892). Without it a
+  disk-heavy step (quantization/export scratch, dataset unpack) rides at
+  request 0 — best-effort on disk, first evicted under node pressure, and
+  schedulable onto nearly-full nodes. The enhancer injects a platform
+  default for steps that don't set it, so this knob is for steps that need
+  MORE than the baseline;
 - `needs=[other]` wires dependencies AND feeds every declared output of
   the needed step in as an input; a needed step that is conditional
   (`when=`) gets a skip-tolerant depends expression automatically.
@@ -49,17 +55,23 @@ STEP_COMMAND = ["python", "-m", "app.entry"]
 _current = None
 
 
+# Kubernetes resource quantity ("10Gi", "512Mi", "2G"); anchored so a typo
+# ("10 Gi", "10GB") fails the render instead of rendering an invalid manifest.
+_DISK_QUANTITY_RE = re.compile(r"^[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)?$")
+
+
 class Step:
-    def __init__(self, name, reads=None, gpu=False, needs=None, outputs=None, when=None):
+    def __init__(self, name, reads=None, gpu=False, needs=None, outputs=None, when=None, disk=None):
         self.name = name
         self.reads = list(reads or [])
         self.gpu = gpu
         self.needs = list(needs or [])
         self.outputs = list(outputs or [])
         self.when = when
+        self.disk = disk
 
 
-def step(name, reads=None, gpu=False, needs=None, outputs=None, when=None) -> Step:
+def step(name, reads=None, gpu=False, needs=None, outputs=None, when=None, disk=None) -> Step:
     if _current is None:
         raise RuntimeError("step() must be called inside `with pipeline(...):`")
     if not isinstance(name, str) or not _STEP_NAME_RE.match(name):
@@ -74,7 +86,12 @@ def step(name, reads=None, gpu=False, needs=None, outputs=None, when=None) -> St
             f"duplicate step name {name!r} — every step must be uniquely named "
             f"(it is the step's identity in the DAG and its image)."
         )
-    s = Step(name, reads, gpu, needs, outputs, when)
+    if disk is not None and not (isinstance(disk, str) and _DISK_QUANTITY_RE.match(disk)):
+        raise AuthoringError(
+            f"step {name!r}: disk={disk!r} is not a Kubernetes quantity — use a "
+            f"string like '20Gi' (digits + optional Ki/Mi/Gi/Ti/K/M/G/T suffix)."
+        )
+    s = Step(name, reads, gpu, needs, outputs, when, disk)
     _current.steps.append(s)
     return s
 
@@ -131,7 +148,16 @@ class pipeline:
                 containers[s.name] = Container(
                     name=s.name, image=IMAGE,
                     command=STEP_COMMAND, args=args,
-                    resources=Resources(gpus=1) if s.gpu else None,
+                    # Request-only for disk: the request is the eviction shield
+                    # and scheduling signal; a limit would OOM-kill spiky export
+                    # scratch instead (#892). The enhancer reads this as the
+                    # developer-set value and keys the {step}-disk knob off it.
+                    resources=Resources(
+                        gpus=1 if s.gpu else None,
+                        ephemeral_request=s.disk,
+                    )
+                    if (s.gpu or s.disk)
+                    else None,
                     inputs=inputs,
                     outputs=[
                         Parameter(name=out, value_from=ValueFrom(path=f"/work/output/{out}.json", default="{}"))
