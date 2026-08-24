@@ -113,6 +113,21 @@ def test_registry_token_only_for_gar_hosts():
     assert 'docker.pkg.dev' in line
 
 
+def test_submit_code_shell_quotes_command_tokens(monkeypatch):
+    """argv tokens with spaces/quotes must survive the env->sh -c ride
+    (live job 5140493: a python -c one-liner arrived as bare words)."""
+    from kubecore.meluxina import MELUXINA_SUBMIT_CODE
+    import json as _json
+    for k, v in {"SLURM_TOKEN": "t", "WF_UID": "u", "STEP_NAME": "s",
+                 "IMAGE_REF": "r/x:t",
+                 "STEP_COMMAND": _json.dumps(["python", "-c", "import torch; print(1)"])}.items():
+        monkeypatch.setenv(k, v)
+    prologue = MELUXINA_SUBMIT_CODE.split("jid = None")[0]
+    g = {}
+    exec(prologue, g)
+    assert g["cmd"] == "python -c 'import torch; print(1)'"
+
+
 def test_hpc_absent_leaves_output_untouched():
     out = enhance(copy.deepcopy(_raw()), _ctx(hpc=False))
     s = json.dumps(out)

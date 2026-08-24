@@ -36,7 +36,7 @@ import re
 # `python3 -c`. Plain string — no Argo tags inside (all run-time inputs
 # arrive via env), so it survives every templating layer verbatim.
 MELUXINA_SUBMIT_CODE = r'''
-import json, os, sys, time, urllib.request
+import json, os, shlex, sys, time, urllib.request
 API = 'https://slurm-api.lxp.lu/slurm/v0.0.44'
 SDB = 'https://slurm-api.lxp.lu/slurmdb/v0.0.44'
 TOK = os.environ['SLURM_TOKEN'].strip()
@@ -58,7 +58,10 @@ if '@' in img:
     if ':' in name.rsplit('/', 1)[-1]:
         name = name.rsplit(':', 1)[0]
     img = name + '@' + digest
-cmd = ' '.join(json.loads(os.environ.get('STEP_COMMAND') or '[]'))
+# shlex-quote each argv token: the joined string rides through Slurm env ->
+# sh -c, and a naive join destroys embedded quoting (live job 5140493:
+# python -c 'import torch; ...' arrived as bare words and exited 2).
+cmd = ' '.join(shlex.quote(t) for t in json.loads(os.environ.get('STEP_COMMAND') or '[]'))
 
 jid = None
 for j in (get(API + '/jobs').get('jobs') or []):
