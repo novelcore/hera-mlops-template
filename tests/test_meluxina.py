@@ -71,6 +71,21 @@ def test_hpc_routes_gpu_step_behind_target_param():
     assert "{{" not in src
 
 
+def test_twin_arguments_never_carry_step_scoped_tags():
+    """A templated step arg ({{inputs.parameters.params}}) copied into a task
+    argument fails Argo spec validation for the WHOLE WorkflowTemplate —
+    every submission, gcp target included (live incident 2026-08-25)."""
+    raw = _raw()
+    tpl = next(t for t in raw["spec"]["templates"] if t["name"] == "model-training")
+    tpl["container"]["args"] = ["{{inputs.parameters.params}}", "--epochs", "1"]
+    out = enhance(copy.deepcopy(raw), _ctx())
+    dag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
+    mel = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-training-meluxina")
+    cmd = next(p for p in mel["arguments"]["parameters"] if p["name"] == "step-command")
+    assert "{{" not in cmd["value"]
+    assert json.loads(cmd["value"]) == ["python", "-m", "train", "--epochs", "1"]
+
+
 def test_hpc_absent_leaves_output_untouched():
     out = enhance(copy.deepcopy(_raw()), _ctx(hpc=False))
     s = json.dumps(out)
