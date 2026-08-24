@@ -86,18 +86,17 @@ def test_twin_arguments_never_carry_step_scoped_tags():
     assert json.loads(cmd["value"]) == ["python", "-m", "train", "--epochs", "1"]
 
 
-def test_submit_code_normalizes_tag_digest_refs():
+def test_submit_code_normalizes_tag_digest_refs(monkeypatch):
     """Apptainer rejects name:tag@digest (live job 5140397); the submit code
     must normalize to digest-only before docker:// pull."""
     from kubecore.meluxina import MELUXINA_SUBMIT_CODE
-    ns = {"os": None}
-    import os as _os
-    env = {"SLURM_TOKEN": "t", "WF_UID": "u", "STEP_NAME": "s",
-           "IMAGE_REF": "reg.example.com/unknown:v1-abc@sha256:deadbeef",
-           "STEP_COMMAND": "[]"}
+    for k, v in {"SLURM_TOKEN": "t", "WF_UID": "u", "STEP_NAME": "s",
+                 "IMAGE_REF": "reg.example.com/unknown:v1-abc@sha256:deadbeef",
+                 "STEP_COMMAND": "[]"}.items():
+        monkeypatch.setenv(k, v)
     # execute only the prologue up to the normalization (stop before network)
     prologue = MELUXINA_SUBMIT_CODE.split("jid = None")[0]
-    g = {"os": type("E", (), {"environ": env})}
+    g = {}
     exec(prologue, g)
     assert g["img"] == "reg.example.com/unknown@sha256:deadbeef"
 
