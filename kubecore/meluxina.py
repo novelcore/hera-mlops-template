@@ -49,6 +49,15 @@ def get(url):
 
 jobname = 'kaos-' + os.environ['WF_UID'] + '-' + os.environ['STEP_NAME']
 img = os.environ['IMAGE_REF']
+# Apptainer rejects tag@digest refs ('Docker references with both a tag and
+# digest are currently not supported', live job 5140397). The platform pins
+# images as name:tag@sha256:... (Zot-retention lesson) — normalize to the
+# digest-only form, which Apptainer accepts and which is the stronger pin.
+if '@' in img:
+    name, digest = img.split('@', 1)
+    if ':' in name.rsplit('/', 1)[-1]:
+        name = name.rsplit(':', 1)[0]
+    img = name + '@' + digest
 cmd = ' '.join(json.loads(os.environ.get('STEP_COMMAND') or '[]'))
 
 jid = None
