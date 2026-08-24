@@ -60,6 +60,8 @@ from pathlib import Path
 
 import yaml
 
+from kubecore.meluxina import enhance_hpc
+
 ANNOTATION_PREFIX = "platform.kubecore.io/"
 KNOWN_ANNOTATIONS = {"compute-class", "inject", "source", "image", "shm", "workspace", "hpc"}
 WORKSPACE_MOUNT = "/workspace"
@@ -869,11 +871,14 @@ def enhance(wft: dict, ctx: dict, catalog: dict = None) -> dict:
     enhance_spec_top_level(spec, ctx)
     steps = step_templates(spec)
     enhance_arguments(spec, ctx, steps)
+    gpu_step_names: set = set()
     for step in steps:
         annots = platform_annotations(step)  # validates; raises on unknown keys
         # Captured BEFORE enhance_gpu_routing strips the typed request — the
         # developer's nvidia.com/gpu declaration is the capability marker.
         gpu = is_gpu_step(step)
+        if gpu:
+            gpu_step_names.add(step["name"])
         enhance_image(step, ctx, annots)
         enhance_env(step, ctx, annots)
         enhance_class_param(spec, step, ctx, annots)
@@ -892,6 +897,10 @@ def enhance(wft: dict, ctx: dict, catalog: dict = None) -> dict:
     enhance_platform_group(steps, ctx)
     enhance_dynamic_enums(spec, ctx, catalog or {})
     enhance_pipeline_info(spec, ctx, steps)
+    # PRD-1016: the MeluXina leg — must run LAST (twin tasks copy each routed
+    # step's FINAL container image/command, and the depends rewrite needs the
+    # final DAG). See kubecore/meluxina.py.
+    enhance_hpc(spec, ctx, steps, gpu_step_names)
     return wft
 
 
