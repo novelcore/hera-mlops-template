@@ -101,6 +101,18 @@ def test_submit_code_normalizes_tag_digest_refs(monkeypatch):
     assert g["img"] == "reg.example.com/unknown@sha256:deadbeef"
 
 
+def test_registry_token_only_for_gar_hosts():
+    """A GCP token presented to Zot turns anonymous-OK pulls into 401
+    (live job 5140432); the batch must gate credentials on *-docker.pkg.dev."""
+    from kubecore.meluxina import MELUXINA_SUBMIT_CODE
+    assert '-docker.pkg.dev/*)' in MELUXINA_SUBMIT_CODE
+    # the export must live INSIDE the case arm, never unconditional
+    import re
+    line = next(l for l in MELUXINA_SUBMIT_CODE.split(chr(92)+"n")
+                if 'APPTAINER_DOCKER_USERNAME' in l)
+    assert 'docker.pkg.dev' in line
+
+
 def test_hpc_absent_leaves_output_untouched():
     out = enhance(copy.deepcopy(_raw()), _ctx(hpc=False))
     s = json.dumps(out)

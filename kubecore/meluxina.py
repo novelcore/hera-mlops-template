@@ -95,9 +95,13 @@ if jid is None:
         'KEY=$(printf %s "$IMAGE_REF" | sha256sum | cut -c1-16)',
         'SIF=$SCR/sif-cache/$KEY.sif',
         'if [ ! -f "$SIF" ]; then',
-        '  [ -n "$REG_TOKEN" ] && export'
+        # GCP token ONLY for GAR hosts: presenting it to Zot turns an
+        # anonymous-OK pull into 401 authentication required (live job
+        # 5140432 vs the anonymous F-01 pull that worked on the same repo).
+        '  case "$IMAGE_REF" in *-docker.pkg.dev/*)'
+        ' [ -n "$REG_TOKEN" ] && export'
         ' APPTAINER_DOCKER_USERNAME=oauth2accesstoken'
-        ' APPTAINER_DOCKER_PASSWORD=$REG_TOKEN',
+        ' APPTAINER_DOCKER_PASSWORD=$REG_TOKEN;; esac',
         '  apptainer pull "$SIF" docker://$IMAGE_REF || exit 231',
         'fi',
         'if [ -n "$STEP_CMD" ]; then apptainer exec --nv "$SIF" /bin/sh -c'
