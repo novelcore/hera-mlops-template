@@ -163,6 +163,16 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
             continue
         task["when"] = "{{=workflow.parameters.target != '%s'}}" % provider
         container = step.get("container") or {}
+        # step-command: only tag-free tokens survive. Hera-authored args carry
+        # Argo tags ({{inputs.parameters.params}}) that resolve against the
+        # STEP template's inputs — copied into a task argument they fail spec
+        # validation for the entire WorkflowTemplate (live-caught 2026-08-25:
+        # one templated token bricked every submission, gcp runs included).
+        # Templated tokens are dropped; an empty result falls back to the
+        # in-template nvidia-smi probe until F-04 wires the real invocation.
+        cmd = [tok for tok in ((container.get("command") or [])
+                               + (container.get("args") or []))
+               if "{{" not in tok]
         twin = {
             "name": task["name"] + "-" + provider,
             "template": "meluxina-run",
@@ -170,8 +180,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
             "arguments": {"parameters": [
                 {"name": "step-name", "value": task["name"]},
                 {"name": "image", "value": container.get("image", "")},
-                {"name": "step-command", "value": json.dumps(
-                    (container.get("command") or []) + (container.get("args") or []))},
+                {"name": "step-command", "value": json.dumps(cmd)},
             ]},
         }
         if task.get("depends"):
