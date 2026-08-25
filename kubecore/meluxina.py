@@ -25,8 +25,16 @@ Operational notes baked in from the live F-01/F-02 shakedown (2026-08):
   * images pull through a digest-keyed Lustre SIF cache (D-02: cold ~8 min,
     warm ~7 s, measured on mel2107); registry auth is a best-effort
     metadata-server access token (GAR);
-  * data-plane env (lakeFS/MLflow endpoints + wallet) lands with F-04/F-08 —
-    until then a meluxina run proves scheduling+image+GPU end-to-end.
+  * data plane (F-04/F-08): the submit pod mints a short-lived Zitadel
+    bearer from the mounted machine key (the same JWT-profile recipe as the
+    seeded mlflow_zitadel_auth module) and passes it in the Slurm job
+    environment together with the PUBLIC MLflow/lakeFS endpoints — never the
+    machine key itself (T-03: no long-lived credential leaves the cluster).
+    The batch script stages the pinned dataset version from the lakeFS
+    public endpoint to a Lustre cache keyed by lakeFS commit (D-04: the
+    in-cluster manifest-only/S3-gateway streaming path is blocked by the
+    SSO front off-cluster) and bind-mounts it read-only at
+    /kubecore/dataset (KUBECORE_DATASET_DIR) for the step.
 """
 
 import json
@@ -36,7 +44,112 @@ import re
 # `python3 -c`. Plain string — no Argo tags inside (all run-time inputs
 # arrive via env), so it survives every templating layer verbatim.
 MELUXINA_SUBMIT_CODE = r'''
-import json, os, shlex, sys, time, urllib.request
+import base64, json, os, shlex, sys, time, urllib.parse, urllib.request
+
+# F-04 stage-in, run ON the compute node (system python3, stdlib only):
+# resolve ref -> commit, download every object of that version from the
+# lakeFS PUBLIC endpoint (bearer through oauth2-proxy — the in-cluster
+# S3-gateway/manifest streaming path is blocked by the SSO front
+# off-cluster) into a Lustre cache keyed by commit, parallel + resumable
+# (size-matched files are skipped, .part rename is atomic). Rides to the
+# node base64-encoded in the job environment.
+STAGEIN = """
+import concurrent.futures, json, os, pathlib, sys, urllib.parse, urllib.request
+EP = os.environ['LAKEFS_ENDPOINT'].rstrip('/')
+H = {'Authorization': 'Bearer ' + os.environ['LAKEFS_BEARER_TOKEN']}
+REPO, REF = os.environ['DATASET_REPO'], os.environ['DATASET_REF']
+def get(url):
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers=H), timeout=120)
+base = EP + '/api/v1/repositories/' + urllib.parse.quote(REPO, safe='')
+commit = json.load(get(base + '/refs/' + urllib.parse.quote(REF, safe='')))[
+    'commit_id']
+dest = pathlib.Path(os.environ['DATASET_CACHE']) / REPO / commit
+open(os.environ['DATASET_DIRFILE'], 'w').write(str(dest))
+if (dest / '.complete').exists():
+    print('stage-in: cache hit', dest, flush=True)
+    sys.exit(0)
+objs, after = [], ''
+while True:
+    page = json.load(get(base + '/refs/' + commit + '/objects/ls?'
+                         + urllib.parse.urlencode(
+                             {'amount': 1000, 'after': after})))
+    objs += [r for r in page.get('results') or []
+             if r.get('path_type') == 'object']
+    pg = page.get('pagination') or {}
+    if not pg.get('has_more'):
+        break
+    after = pg.get('next_offset') or ''
+print('stage-in:', len(objs), 'objects @', commit[:12], flush=True)
+def fetch(o):
+    p = dest / o['path']
+    if p.exists() and p.stat().st_size == o.get('size_bytes'):
+        return 0
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(p) + '.part'
+    with get(base + '/refs/' + commit + '/objects?'
+             + urllib.parse.urlencode({'path': o['path']})) as r:
+        with open(tmp, 'wb') as f:
+            while True:
+                b = r.read(1 << 20)
+                if not b:
+                    break
+                f.write(b)
+    os.replace(tmp, p)
+    return 1
+with concurrent.futures.ThreadPoolExecutor(8) as ex:
+    n = sum(ex.map(fetch, objs))
+(dest / '.complete').touch()
+print('stage-in: downloaded', n, 'of', len(objs), '->', dest, flush=True)
+"""
+
+# F-08 wallet: mint a short-lived Zitadel bearer from the mounted machine
+# key — the same JWT-profile recipe as the seeded mlflow_zitadel_auth
+# module (assertion aud = https://{domain}; the project-audience scope is
+# what makes the token acceptable to mlflow-oidc-auth AND carries the
+# groups claim). PyJWT+cryptography are pip-installed at run time: the
+# submit image is bare-stdlib alpine and RS256 needs real crypto. Any
+# failure degrades loudly to no-wallet (job still runs, data-plane env
+# omitted) — never the machine key itself into the Slurm environment
+# (T-03: HPC-side env must only ever see short-lived tokens).
+def mint_wallet():
+    keyfile = os.environ.get('ZITADEL_MACHINE_KEY_FILE') or ''
+    domain = os.environ.get('ZITADEL_DOMAIN') or ''
+    if not keyfile or not os.path.exists(keyfile) or not domain:
+        print('wallet: machine key / domain absent, data-plane env omitted',
+              flush=True)
+        return ''
+    try:
+        import subprocess
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
+                        '--no-warn-script-location', '--root-user-action',
+                        'ignore', 'PyJWT', 'cryptography'],
+                       check=True, timeout=180)
+        import jwt as pyjwt
+        key = json.load(open(keyfile))
+        now = int(time.time())
+        assertion = pyjwt.encode(
+            {'iss': key['userId'], 'sub': key['userId'],
+             'aud': 'https://' + domain, 'iat': now, 'exp': now + 60},
+            key['key'], algorithm='RS256', headers={'kid': key['keyId']})
+        scope = 'openid email profile urn:zitadel:iam:org:projects:roles'
+        pid = os.environ.get('ZITADEL_MLFLOW_PROJECT_ID') or ''
+        if pid:
+            scope += ' urn:zitadel:iam:org:project:id:' + pid + ':aud'
+        req = urllib.request.Request(
+            'https://' + domain + '/oauth/v2/token',
+            data=urllib.parse.urlencode({
+                'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                'scope': scope, 'assertion': assertion}).encode())
+        tok = json.load(urllib.request.urlopen(req, timeout=30)).get(
+            'access_token', '')
+        print('wallet: minted' if tok else 'wallet: empty token response',
+              flush=True)
+        return tok
+    except Exception as e:
+        print('wallet: mint failed, data-plane env omitted:', e, flush=True)
+        return ''
+
 API = 'https://slurm-api.lxp.lu/slurm/v0.0.44'
 SDB = 'https://slurm-api.lxp.lu/slurmdb/v0.0.44'
 TOK = os.environ['SLURM_TOKEN'].strip()
@@ -97,6 +210,24 @@ if jid is None:
         'mkdir -p $APPTAINER_CACHEDIR $APPTAINER_TMPDIR $SCR/sif-cache',
         'KEY=$(printf %s "$IMAGE_REF" | sha256sum | cut -c1-16)',
         'SIF=$SCR/sif-cache/$KEY.sif',
+        # F-04 stage-in: only when the wallet minted AND the run pins a
+        # dataset. Fails LOUDLY (exit 232) — silently missing data would
+        # surface as a cryptic training error hours later.
+        'DATASET_DIR=""',
+        'if [ -n "$LAKEFS_BEARER_TOKEN" ] && [ -n "$LAKEFS_ENDPOINT" ] &&'
+        ' [ -n "$DATASET_REPO" ] && [ -n "$DATASET_REF" ] &&'
+        ' [ -n "$STAGEIN_B64" ] && command -v python3 >/dev/null; then',
+        '  export DATASET_CACHE=$SCR/data-cache'
+        ' DATASET_DIRFILE=$SCR/kaos-tmp/ds-$SLURM_JOB_ID.dir',
+        '  printf %s "$STAGEIN_B64" | base64 -d | python3 - || exit 232',
+        '  DATASET_DIR=$(cat "$DATASET_DIRFILE" 2>/dev/null)',
+        'fi',
+        # Apptainer passes the host env through, so the wallet/endpoint vars
+        # reach the step; the bind gives it the staged version read-only.
+        'BIND=""',
+        'if [ -n "$DATASET_DIR" ]; then'
+        ' BIND="-B $DATASET_DIR:/kubecore/dataset:ro";'
+        ' export APPTAINERENV_KUBECORE_DATASET_DIR=/kubecore/dataset; fi',
         'if [ ! -f "$SIF" ]; then',
         # GCP token ONLY for GAR hosts: presenting it to Zot turns an
         # anonymous-OK pull into 401 authentication required (live job
@@ -107,12 +238,30 @@ if jid is None:
         ' APPTAINER_DOCKER_PASSWORD=$REG_TOKEN;; esac',
         '  apptainer pull "$SIF" docker://$IMAGE_REF || exit 231',
         'fi',
-        'if [ -n "$STEP_CMD" ]; then apptainer exec --nv "$SIF" /bin/sh -c'
-        ' "$STEP_CMD"; else apptainer exec --nv "$SIF" nvidia-smi -L; fi',
+        'if [ -n "$STEP_CMD" ]; then apptainer exec --nv $BIND "$SIF"'
+        ' /bin/sh -c "$STEP_CMD"; else apptainer exec --nv $BIND "$SIF"'
+        ' nvidia-smi -L; fi',
     ])
     env = ['PATH=/usr/bin:/bin:/usr/local/bin', 'HOME=/home/users/u104378',
            'USER=u104378', 'IMAGE_REF=' + img, 'REG_TOKEN=' + reg,
            'STEP_CMD=' + cmd]
+    wallet = mint_wallet()
+    if wallet:
+        # Public endpoints only, short-lived bearer only (T-03). MLflow's
+        # client honors MLFLOW_TRACKING_TOKEN natively; the stage-in and any
+        # in-step lakeFS API calls ride the same bearer through oauth2-proxy.
+        mlflow_url = os.environ.get('MLFLOW_EXTERNAL_URL') or ''
+        lakefs_url = os.environ.get('LAKEFS_EXTERNAL_URL') or ''
+        if mlflow_url:
+            env += ['MLFLOW_TRACKING_URI=' + mlflow_url,
+                    'MLFLOW_TRACKING_TOKEN=' + wallet]
+        if lakefs_url:
+            env += ['LAKEFS_ENDPOINT=' + lakefs_url,
+                    'LAKEFS_BEARER_TOKEN=' + wallet,
+                    'DATASET_REPO=' + (os.environ.get('DATASET_REPO') or ''),
+                    'DATASET_REF=' + (os.environ.get('DATASET_REF') or ''),
+                    'STAGEIN_B64='
+                    + base64.b64encode(STAGEIN.encode()).decode()]
     body = {'job': {'name': jobname, 'partition': 'gpu',
                     'account': 'p201342', 'qos': 'default', 'time_limit': 240,
                     'current_working_directory': '/home/users/u104378',
@@ -179,16 +328,25 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
             continue
         task["when"] = "{{=workflow.parameters.target != '%s'}}" % provider
         container = step.get("container") or {}
-        # step-command: only tag-free tokens survive. Hera-authored args carry
-        # Argo tags ({{inputs.parameters.params}}) that resolve against the
-        # STEP template's inputs — copied into a task argument they fail spec
-        # validation for the entire WorkflowTemplate (live-caught 2026-08-25:
-        # one templated token bricked every submission, gcp runs included).
-        # Templated tokens are dropped; an empty result falls back to the
-        # in-template nvidia-smi probe until F-04 wires the real invocation.
-        cmd = [tok for tok in ((container.get("command") or [])
-                               + (container.get("args") or []))
-               if "{{" not in tok]
+        # step-command: {{inputs.parameters.X}} tokens resolve against the
+        # STEP template's inputs — copied verbatim into a task argument they
+        # fail spec validation for the entire WorkflowTemplate (live-caught
+        # 2026-08-25: one templated token bricked every submission, gcp runs
+        # included). But the DAG task's OWN arguments carry each input's
+        # value (a literal or a task-context-valid expression like
+        # {{workflow.parameters.x}}), so substituting from them yields the
+        # real invocation (F-04). Anything still step-scoped after
+        # substitution is dropped; an empty result falls back to the
+        # in-template nvidia-smi probe.
+        argmap = {p.get("name"): str(p.get("value", ""))
+                  for p in ((task.get("arguments") or {}).get("parameters")
+                            or [])}
+        cmd = [re.sub(r"\{\{\s*inputs\.parameters\.([A-Za-z0-9_.-]+)\s*\}\}",
+                      lambda m: argmap.get(m.group(1), ""), tok)
+               for tok in ((container.get("command") or [])
+                           + (container.get("args") or []))]
+        cmd = [t for t in cmd
+               if t and "{{inputs." not in t and "{{item" not in t]
         twin = {
             "name": task["name"] + "-" + provider,
             "template": "meluxina-run",
@@ -222,15 +380,35 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
             dep = re.sub(r"(?<![\w.-])%s(?![\w.-])" % re.escape(r), pair, dep)
         task["depends"] = dep
 
+    # F-08 wallet inputs: the machine key mounts optional:true (same shape
+    # the legacy render-wft uses on every step) so a non-OIDC deployment
+    # still submits — the submit code degrades to no-wallet loudly. Dataset
+    # coordinates prefer the pipeline's own workflow params (Alexandra's
+    # WFTs carry lakefs-repo / data-ref) and fall back to the context
+    # repository; no param -> no stage-in, batch runs the step data-less.
+    mlflow_ctx = ctx.get("mlflow") or {}
+    lakefs_ctx = ctx.get("lakefs") or {}
+    wf_params = {p.get("name") for p in parameters}
+    dataset_repo = ("{{workflow.parameters.lakefs-repo}}"
+                    if "lakefs-repo" in wf_params
+                    else str(lakefs_ctx.get("repository") or ""))
+    dataset_ref = ("{{workflow.parameters.data-ref}}"
+                   if "data-ref" in wf_params else "")
     spec["templates"].append({
         "name": "meluxina-run",
         "inputs": {"parameters": [
             {"name": "step-name"}, {"name": "image"}, {"name": "step-command"}]},
         "activeDeadlineSeconds": 14400,
         "metadata": {"labels": {"platform.kubecore.io/compute-type": "hpc"}},
+        "volumes": [{"name": "mlflow-svc", "secret": {
+            "secretName": str(mlflow_ctx.get("svcSecret") or "mlflow-svc"),
+            "optional": True}}],
         "container": {
             "image": "python:3.12-alpine",
             "command": ["python3", "-c", MELUXINA_SUBMIT_CODE],
+            "volumeMounts": [{"name": "mlflow-svc",
+                              "mountPath": "/etc/mlflow-svc",
+                              "readOnly": True}],
             "env": [
                 {"name": "SLURM_TOKEN", "valueFrom": {"secretKeyRef": {
                     "name": "meluxina-jwt", "key": "token"}}},
@@ -238,6 +416,18 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
                 {"name": "STEP_NAME", "value": "{{inputs.parameters.step-name}}"},
                 {"name": "IMAGE_REF", "value": "{{inputs.parameters.image}}"},
                 {"name": "STEP_COMMAND", "value": "{{inputs.parameters.step-command}}"},
+                {"name": "ZITADEL_MACHINE_KEY_FILE",
+                 "value": "/etc/mlflow-svc/ZITADEL_MACHINE_KEY"},
+                {"name": "ZITADEL_DOMAIN",
+                 "value": str(mlflow_ctx.get("oidcDomain") or "")},
+                {"name": "ZITADEL_MLFLOW_PROJECT_ID",
+                 "value": str(mlflow_ctx.get("oidcProjectId") or "")},
+                {"name": "MLFLOW_EXTERNAL_URL",
+                 "value": str(mlflow_ctx.get("externalUrl") or "")},
+                {"name": "LAKEFS_EXTERNAL_URL",
+                 "value": str(lakefs_ctx.get("externalUrl") or "")},
+                {"name": "DATASET_REPO", "value": dataset_repo},
+                {"name": "DATASET_REF", "value": dataset_ref},
             ],
         },
         "outputs": {"parameters": [{"name": "slurm-job-id",

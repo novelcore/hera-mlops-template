@@ -132,3 +132,95 @@ def test_hpc_absent_leaves_output_untouched():
     out = enhance(copy.deepcopy(_raw()), _ctx(hpc=False))
     s = json.dumps(out)
     assert "meluxina" not in s and '"target"' not in s
+
+
+def test_twin_command_substitutes_task_arguments():
+    """F-04: the twin resolves {{inputs.parameters.X}} from the DAG task's
+    own arguments (literals or task-context-valid workflow refs), so the
+    real invocation reaches MeluXina instead of the nvidia-smi fallback."""
+    raw = _raw()
+    tpl = next(t for t in raw["spec"]["templates"] if t["name"] == "model-training")
+    tpl["container"]["args"] = ["--config", "{{inputs.parameters.config}}",
+                                "--epochs", "{{inputs.parameters.epochs}}"]
+    dag = next(t for t in raw["spec"]["templates"] if t["name"] == "p")
+    task = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-training")
+    task["arguments"] = {"parameters": [
+        {"name": "config", "value": "{{workflow.parameters.config}}"},
+        {"name": "epochs", "value": "5"},
+    ]}
+    out = enhance(copy.deepcopy(raw), _ctx())
+    odag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
+    mel = next(t for t in odag["dag"]["tasks"] if t["name"] == "model-training-meluxina")
+    cmd = json.loads(next(p for p in mel["arguments"]["parameters"]
+                          if p["name"] == "step-command")["value"])
+    assert cmd == ["python", "-m", "train", "--config",
+                   "{{workflow.parameters.config}}", "--epochs", "5"]
+    # step-scoped tags never survive (WFT-wide validation, live 2026-08-25)
+    assert not any("{{inputs." in t for t in cmd)
+
+
+def test_meluxina_run_carries_wallet_plumbing():
+    """F-08: the submit pod gets the machine-key mount (optional — non-OIDC
+    deployments still submit), the Zitadel coordinates, the PUBLIC
+    endpoints, and dataset coordinates — never the key into Slurm env."""
+    raw = _raw()
+    raw["spec"]["arguments"]["parameters"] = [
+        {"name": "lakefs-repo", "value": "r"}, {"name": "data-ref", "value": "dev"}]
+    out = enhance(copy.deepcopy(raw), _ctx())
+    mr = next(t for t in out["spec"]["templates"] if t["name"] == "meluxina-run")
+    vols = {v["name"]: v for v in mr["volumes"]}
+    assert vols["mlflow-svc"]["secret"]["optional"] is True
+    assert vols["mlflow-svc"]["secret"]["secretName"] == "PLACEHOLDER-mlflow-svc"
+    mounts = {m["name"]: m for m in mr["container"]["volumeMounts"]}
+    assert mounts["mlflow-svc"]["mountPath"] == "/etc/mlflow-svc"
+    env = {e["name"]: e.get("value") for e in mr["container"]["env"]}
+    assert env["ZITADEL_MACHINE_KEY_FILE"] == "/etc/mlflow-svc/ZITADEL_MACHINE_KEY"
+    assert env["ZITADEL_DOMAIN"] == "oidc.internal.invalid"
+    assert env["MLFLOW_EXTERNAL_URL"] == "https://mlflow.internal.invalid"
+    assert env["LAKEFS_EXTERNAL_URL"] == "https://lakefs.internal.invalid"
+    # dataset coordinates prefer the pipeline's own workflow params
+    assert env["DATASET_REPO"] == "{{workflow.parameters.lakefs-repo}}"
+    assert env["DATASET_REF"] == "{{workflow.parameters.data-ref}}"
+
+
+def test_dataset_coordinates_fall_back_to_context():
+    """enhance() itself injects the lakefs-repo workflow param (earlier
+    pass), so repo always resolves via the param; data-ref comes only from
+    the app's own authoring — absent, ref stays empty (stage-in disabled,
+    not broken)."""
+    out = enhance(copy.deepcopy(_raw()), _ctx())
+    mr = next(t for t in out["spec"]["templates"] if t["name"] == "meluxina-run")
+    env = {e["name"]: e.get("value") for e in mr["container"]["env"]}
+    assert env["DATASET_REPO"] == "{{workflow.parameters.lakefs-repo}}"
+    assert env["DATASET_REF"] == ""
+
+
+def test_submit_code_stagein_and_wallet_invariants():
+    """T-03/D-04 invariants pinned at source level: the machine key never
+    enters the Slurm environment; stage-in fails loudly; the bearer rides
+    both MLflow and lakeFS; the batch bind-mounts the staged version."""
+    from kubecore.meluxina import MELUXINA_SUBMIT_CODE as src
+    # wallet: minted in-cluster, key file read locally, never exported
+    assert "mint_wallet" in src and "ZITADEL_MACHINE_KEY_FILE" in src
+    assert "ZITADEL_MACHINE_KEY=" not in src  # no key material into env
+    assert "MLFLOW_TRACKING_TOKEN=" in src and "LAKEFS_BEARER_TOKEN=" in src
+    # stage-in: commit-keyed Lustre cache, loud failure, read-only bind
+    assert "data-cache" in src and "|| exit 232" in src
+    assert "/kubecore/dataset:ro" in src
+    assert "APPTAINERENV_KUBECORE_DATASET_DIR" in src
+    # the stage-in payload rides base64 in env and runs on system python3
+    assert "STAGEIN_B64" in src and "base64 -d" in src
+    # no Argo tags anywhere in the program (survives templating verbatim)
+    assert "{{" not in src
+
+
+def test_stagein_code_is_valid_python():
+    """The embedded stage-in payload must parse standalone — it executes on
+    the compute node's system python3 with no packaging step in between."""
+    import ast
+    from kubecore.meluxina import MELUXINA_SUBMIT_CODE
+    g = {}
+    # executing the module-level defs is network-free; STAGEIN is a constant
+    prologue = MELUXINA_SUBMIT_CODE.split("API = ")[0]
+    exec(prologue, g)
+    ast.parse(g["STAGEIN"])
