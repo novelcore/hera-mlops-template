@@ -174,7 +174,10 @@ if '@' in img:
 # shlex-quote each argv token: the joined string rides through Slurm env ->
 # sh -c, and a naive join destroys embedded quoting (live job 5140493:
 # python -c 'import torch; ...' arrived as bare words and exited 2).
-cmd = ' '.join(shlex.quote(t) for t in json.loads(os.environ.get('STEP_COMMAND') or '[]'))
+# strict=False tolerates control characters inside strings — belt-and-braces
+# for any substitution path the render-side toJson escaping didn't cover.
+cmd = ' '.join(shlex.quote(t) for t in json.loads(
+    os.environ.get('STEP_COMMAND') or '[]', strict=False))
 
 jid = None
 for j in (get(API + '/jobs').get('jobs') or []):
@@ -297,6 +300,39 @@ while True:
 '''
 
 
+_WF_PARAM_TAG = re.compile(r"\{\{\s*workflow\.parameters\.([A-Za-z0-9_.-]+)\s*\}\}")
+
+
+def _cmd_json(cmd: list) -> str:
+    """Render the step-command as a JSON array that STAYS valid JSON after
+    Argo's parameter substitution.
+
+    A naive json.dumps breaks at run time (live job, wf mgznz 2026-08-25):
+    Argo substitutes {{workflow.parameters.X}} INSIDE the already-serialized
+    string, and a multi-line param value (config is a whole YAML doc) lands
+    raw newlines/quotes inside a JSON string — the submit pod's json.loads
+    dies on 'invalid control character'. Fix: tokens carrying workflow-param
+    tags are emitted as {{=toJson(...)}} expressions, so Argo itself
+    JSON-escapes the substituted value; literal tokens stay json.dumps'd.
+    Mixed tokens rebuild the full string inside the expression via
+    single-quoted concatenation."""
+    parts = []
+    for tok in cmd:
+        if not _WF_PARAM_TAG.search(tok):
+            parts.append(json.dumps(tok))
+            continue
+        exprs, pos = [], 0
+        for m in _WF_PARAM_TAG.finditer(tok):
+            if m.start() > pos:
+                exprs.append("'%s'" % tok[pos:m.start()].replace("\\", "\\\\").replace("'", "\\'"))
+            exprs.append("workflow.parameters['%s']" % m.group(1))
+            pos = m.end()
+        if pos < len(tok):
+            exprs.append("'%s'" % tok[pos:].replace("\\", "\\\\").replace("'", "\\'"))
+        parts.append("{{=toJson(%s)}}" % " + ".join(exprs))
+    return "[" + ", ".join(parts) + "]"
+
+
 def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None:
     """Route GPU steps to MeluXina behind the `target` param (module doc)."""
     hpc = ctx.get("hpc") or {}
@@ -354,7 +390,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
             "arguments": {"parameters": [
                 {"name": "step-name", "value": task["name"]},
                 {"name": "image", "value": container.get("image", "")},
-                {"name": "step-command", "value": json.dumps(cmd)},
+                {"name": "step-command", "value": _cmd_json(cmd)},
             ]},
         }
         if task.get("depends"):

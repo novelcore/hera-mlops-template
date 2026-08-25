@@ -82,7 +82,9 @@ def test_twin_arguments_never_carry_step_scoped_tags():
     dag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
     mel = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-training-meluxina")
     cmd = next(p for p in mel["arguments"]["parameters"] if p["name"] == "step-command")
-    assert "{{" not in cmd["value"]
+    # step-scoped tags must never survive; expression tags ({{=...}}) are the
+    # ONLY templating allowed (they are task-context-valid and self-escaping)
+    assert "{{inputs." not in cmd["value"]
     assert json.loads(cmd["value"]) == ["python", "-m", "train", "--epochs", "1"]
 
 
@@ -151,12 +153,24 @@ def test_twin_command_substitutes_task_arguments():
     out = enhance(copy.deepcopy(raw), _ctx())
     odag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
     mel = next(t for t in odag["dag"]["tasks"] if t["name"] == "model-training-meluxina")
-    cmd = json.loads(next(p for p in mel["arguments"]["parameters"]
-                          if p["name"] == "step-command")["value"])
-    assert cmd == ["python", "-m", "train", "--config",
-                   "{{workflow.parameters.config}}", "--epochs", "5"]
-    # step-scoped tags never survive (WFT-wide validation, live 2026-08-25)
-    assert not any("{{inputs." in t for t in cmd)
+    val = next(p for p in mel["arguments"]["parameters"]
+               if p["name"] == "step-command")["value"]
+    # Param-carrying tokens ride as {{=toJson(...)}} expressions so Argo
+    # JSON-escapes the substituted value (live wf mgznz 2026-08-25: a plain
+    # {{workflow.parameters.config}} inside json.dumps output put raw
+    # newlines in the JSON string -> submit pod json.loads died on
+    # "invalid control character"). Literals stay plain JSON.
+    assert val == ('["python", "-m", "train", "--config", '
+                   "{{=toJson(workflow.parameters['config'])}}"
+                   ', "--epochs", "5"]')
+    assert "{{inputs." not in val
+    # simulate Argo substituting a multi-line, quote-carrying value: the
+    # result must parse as JSON and preserve the value byte-for-byte
+    nasty = 'line1\nline2 "quoted" \\backslash'
+    substituted = val.replace(
+        "{{=toJson(workflow.parameters['config'])}}", json.dumps(nasty))
+    assert json.loads(substituted) == [
+        "python", "-m", "train", "--config", nasty, "--epochs", "5"]
 
 
 def test_meluxina_run_carries_wallet_plumbing():
@@ -224,3 +238,16 @@ def test_stagein_code_is_valid_python():
     prologue = MELUXINA_SUBMIT_CODE.split("API = ")[0]
     exec(prologue, g)
     ast.parse(g["STAGEIN"])
+
+
+def test_cmd_json_mixed_and_literal_tokens():
+    """_cmd_json escaping table: literal -> plain JSON; pure-tag ->
+    toJson(param); mixed -> toJson of single-quoted concatenation (quotes
+    in the literal part escaped for the expr string)."""
+    from kubecore.meluxina import _cmd_json
+    out = _cmd_json(["run", "--epochs={{workflow.parameters.epochs}}",
+                     "it's", "{{workflow.parameters.cfg}}"])
+    assert out == ('["run", '
+                   "{{=toJson('--epochs=' + workflow.parameters['epochs'])}}"
+                   ', "it\'s", '
+                   "{{=toJson(workflow.parameters['cfg'])}}]")
