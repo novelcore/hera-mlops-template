@@ -161,14 +161,14 @@ def test_twin_command_substitutes_task_arguments():
     # newlines in the JSON string -> submit pod json.loads died on
     # "invalid control character"). Literals stay plain JSON.
     assert val == ('["python", "-m", "train", "--config", '
-                   "{{=toJson(workflow.parameters['config'])}}"
+                   "{{=toJson(workflow.parameters.config)}}"
                    ', "--epochs", "5"]')
     assert "{{inputs." not in val
     # simulate Argo substituting a multi-line, quote-carrying value: the
     # result must parse as JSON and preserve the value byte-for-byte
     nasty = 'line1\nline2 "quoted" \\backslash'
     substituted = val.replace(
-        "{{=toJson(workflow.parameters['config'])}}", json.dumps(nasty))
+        "{{=toJson(workflow.parameters.config)}}", json.dumps(nasty))
     assert json.loads(substituted) == [
         "python", "-m", "train", "--config", nasty, "--epochs", "5"]
 
@@ -248,6 +248,14 @@ def test_cmd_json_mixed_and_literal_tokens():
     out = _cmd_json(["run", "--epochs={{workflow.parameters.epochs}}",
                      "it's", "{{workflow.parameters.cfg}}"])
     assert out == ('["run", '
-                   "{{=toJson('--epochs=' + workflow.parameters['epochs'])}}"
+                   "{{=toJson('--epochs=' + workflow.parameters.epochs)}}"
                    ', "it\'s", '
-                   "{{=toJson(workflow.parameters['cfg'])}}]")
+                   "{{=toJson(workflow.parameters.cfg)}}]")
+    # tasks-output tags (the live mgznz payload: compose-and-validate's
+    # multi-line params.yaml output) get the same treatment — hyphenated
+    # segments via bracket access, identifier segments via dots
+    out2 = _cmd_json(["--params",
+                      "{{tasks.compose-and-validate.outputs.parameters.params}}"])
+    assert out2 == ('["--params", '
+                    "{{=toJson(tasks['compose-and-validate']"
+                    ".outputs.parameters.params)}}]")

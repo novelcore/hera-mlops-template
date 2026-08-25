@@ -300,32 +300,46 @@ while True:
 '''
 
 
-_WF_PARAM_TAG = re.compile(r"\{\{\s*workflow\.parameters\.([A-Za-z0-9_.-]+)\s*\}\}")
+_SUBST_TAG = re.compile(
+    r"\{\{\s*((?:workflow\.parameters|tasks)\.[A-Za-z0-9_.-]+)\s*\}\}")
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _tag_expr(path: str) -> str:
+    """Convert a dotted Argo tag path to expression syntax, using bracket
+    access for segments that are not bare identifiers (task and param names
+    routinely carry hyphens: tasks.compose-and-validate.outputs...)."""
+    segs = path.split(".")
+    out = segs[0]
+    for s in segs[1:]:
+        out += "." + s if _IDENT.match(s) else "['%s']" % s
+    return out
 
 
 def _cmd_json(cmd: list) -> str:
     """Render the step-command as a JSON array that STAYS valid JSON after
     Argo's parameter substitution.
 
-    A naive json.dumps breaks at run time (live job, wf mgznz 2026-08-25):
-    Argo substitutes {{workflow.parameters.X}} INSIDE the already-serialized
-    string, and a multi-line param value (config is a whole YAML doc) lands
-    raw newlines/quotes inside a JSON string — the submit pod's json.loads
-    dies on 'invalid control character'. Fix: tokens carrying workflow-param
-    tags are emitted as {{=toJson(...)}} expressions, so Argo itself
-    JSON-escapes the substituted value; literal tokens stay json.dumps'd.
-    Mixed tokens rebuild the full string inside the expression via
-    single-quoted concatenation."""
+    A naive json.dumps breaks at run time (live wf mgznz 2026-08-25): Argo
+    substitutes {{workflow.parameters.X}} / {{tasks.X.outputs.parameters.Y}}
+    INSIDE the already-serialized string, and a multi-line value (the
+    compose-and-validate params.yaml output is a whole YAML doc) lands raw
+    newlines/quotes inside a JSON string — the submit pod's json.loads dies
+    on 'invalid control character'. Fix: tokens carrying substitutable tags
+    are emitted as {{=toJson(...)}} expressions, so Argo itself JSON-escapes
+    the substituted value; literal tokens stay json.dumps'd. Mixed tokens
+    rebuild the full string inside the expression via single-quoted
+    concatenation."""
     parts = []
     for tok in cmd:
-        if not _WF_PARAM_TAG.search(tok):
+        if not _SUBST_TAG.search(tok):
             parts.append(json.dumps(tok))
             continue
         exprs, pos = [], 0
-        for m in _WF_PARAM_TAG.finditer(tok):
+        for m in _SUBST_TAG.finditer(tok):
             if m.start() > pos:
                 exprs.append("'%s'" % tok[pos:m.start()].replace("\\", "\\\\").replace("'", "\\'"))
-            exprs.append("workflow.parameters['%s']" % m.group(1))
+            exprs.append(_tag_expr(m.group(1)))
             pos = m.end()
         if pos < len(tok):
             exprs.append("'%s'" % tok[pos:].replace("\\", "\\\\").replace("'", "\\'"))
