@@ -62,8 +62,11 @@ def get(url):
     return urllib.request.urlopen(
         urllib.request.Request(url, headers=H), timeout=120)
 base = EP + '/api/v1/repositories/' + urllib.parse.quote(REPO, safe='')
-commit = json.load(get(base + '/refs/' + urllib.parse.quote(REF, safe='')))[
-    'commit_id']
+# ref -> tip commit via the commit LOG (amount=1). GET /refs/{ref} does not
+# exist on our lakeFS version (404, live job 5143633) — the seeded loader's
+# /refs/{ref}/commits endpoint is the proven one.
+commit = json.load(get(base + '/refs/' + urllib.parse.quote(REF, safe='')
+                       + '/commits?amount=1'))['results'][0]['id']
 dest = pathlib.Path(os.environ['DATASET_CACHE']) / REPO / commit
 open(os.environ['DATASET_DIRFILE'], 'w').write(str(dest))
 if (dest / '.complete').exists():
