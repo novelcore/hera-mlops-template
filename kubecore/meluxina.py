@@ -44,7 +44,7 @@ import re
 # `python3 -c`. Plain string — no Argo tags inside (all run-time inputs
 # arrive via env), so it survives every templating layer verbatim.
 MELUXINA_SUBMIT_CODE = r'''
-import base64, json, os, shlex, sys, time, urllib.parse, urllib.request
+import base64, json, os, shlex, signal, sys, time, urllib.parse, urllib.request
 
 # F-04 stage-in, run ON the compute node (system python3, stdlib only):
 # resolve ref -> commit, download every object of that version from the
@@ -183,15 +183,18 @@ cmd = ' '.join(shlex.quote(t) for t in json.loads(
     os.environ.get('STEP_COMMAND') or '[]', strict=False))
 
 jid = None
-for j in (get(API + '/jobs').get('jobs') or []):
-    st = j.get('job_state') or []
-    if j.get('name') == jobname and any(
-            x in ('PENDING', 'RUNNING', 'SUSPENDED') for x in st):
-        jid = j.get('job_id')
-        print('adopting existing job', jid, flush=True)
-        break
 
-if jid is None:
+
+def find_active():
+    for j in (get(API + '/jobs').get('jobs') or []):
+        st = j.get('job_state') or []
+        if j.get('name') == jobname and any(
+                x in ('PENDING', 'RUNNING', 'SUSPENDED') for x in st):
+            return j.get('job_id')
+    return None
+
+
+def submit():
     reg = ''
     try:
         r = urllib.request.Request(
@@ -206,10 +209,14 @@ if jid is None:
     batch = '\n'.join([
         '#!/bin/bash -l',
         'set +e',
+        # Diagnostics without SSH (live job 5143859: exit 231 with no way to
+        # see WHY): on any failure, tail this job's own output file into its
+        # job COMMENT — readable over REST from the waiter and by operators.
+        'fail(){ scontrol update JobId=$SLURM_JOB_ID Comment="err$1:$(tail -c 700 slurm-$SLURM_JOB_ID.out 2>/dev/null | tr "\\n" "|")" 2>/dev/null; exit $1; }',
         'for f in /usr/share/lmod/lmod/init/bash /etc/profile.d/lmod.sh; do'
         ' [ -r "$f" ] && source "$f" && break; done',
         'module load Apptainer 2>/dev/null || module load apptainer 2>/dev/null',
-        'command -v apptainer >/dev/null || exit 210',
+        'command -v apptainer >/dev/null || fail 210',
         'SCR=/project/scratch/p201342',
         'export APPTAINER_CACHEDIR=$SCR/kaos-apptainer-cache'
         ' APPTAINER_TMPDIR=$SCR/kaos-tmp',
@@ -225,7 +232,7 @@ if jid is None:
         ' [ -n "$STAGEIN_B64" ] && command -v python3 >/dev/null; then',
         '  export DATASET_CACHE=$SCR/data-cache'
         ' DATASET_DIRFILE=$SCR/kaos-tmp/ds-$SLURM_JOB_ID.dir',
-        '  printf %s "$STAGEIN_B64" | base64 -d | python3 - || exit 232',
+        '  printf %s "$STAGEIN_B64" | base64 -d | python3 - || fail 232',
         '  DATASET_DIR=$(cat "$DATASET_DIRFILE" 2>/dev/null)',
         'fi',
         # Apptainer passes the host env through, so the wallet/endpoint vars
@@ -242,11 +249,13 @@ if jid is None:
         ' [ -n "$REG_TOKEN" ] && export'
         ' APPTAINER_DOCKER_USERNAME=oauth2accesstoken'
         ' APPTAINER_DOCKER_PASSWORD=$REG_TOKEN;; esac',
-        '  apptainer pull "$SIF" docker://$IMAGE_REF || exit 231',
+        '  apptainer pull "$SIF" docker://$IMAGE_REF || fail 231',
         'fi',
         'if [ -n "$STEP_CMD" ]; then apptainer exec --nv $BIND "$SIF"'
         ' /bin/sh -c "$STEP_CMD"; else apptainer exec --nv $BIND "$SIF"'
         ' nvidia-smi -L; fi',
+        'rc=$?; [ $rc -ne 0 ] && fail $rc',
+        'exit 0',
     ])
     env = ['PATH=/usr/bin:/bin:/usr/local/bin', 'HOME=/home/users/u104378',
            'USER=u104378', 'IMAGE_REF=' + img, 'REG_TOKEN=' + reg,
@@ -277,14 +286,49 @@ if jid is None:
                                  data=json.dumps(body).encode(),
                                  headers=H, method='POST')
     resp = json.load(urllib.request.urlopen(req, timeout=30))
-    jid = resp.get('job_id')
-    print('submitted job', jid, 'errors:', resp.get('errors'), flush=True)
-    if not jid:
+    j = resp.get('job_id')
+    print('submitted job', j, 'errors:', resp.get('errors'), flush=True)
+    if not j:
         sys.exit(1)
+    return j
+
+
+def cancel(j):
+    try:
+        urllib.request.urlopen(urllib.request.Request(
+            API + '/job/' + str(j), headers=H, method='DELETE'), timeout=30)
+        print('cancelled job', j, flush=True)
+    except Exception as e:
+        print('cancel failed:', e, flush=True)
+
+
+def on_term(signum, frame):
+    # Argo sends TERM on deadline/stop. A PENDING job never started — cancel
+    # it so it does not run unobserved hours later (live job 5143859 did
+    # exactly that: waiter killed at the deadline mid-queue, job ran at
+    # 20:0xZ with nobody watching and burned a failed pull). A RUNNING job
+    # is deliberately left to finish.
+    try:
+        j = (get(API + '/job/' + str(jid)).get('jobs') or [{}])[0]
+        if 'PENDING' in (j.get('job_state') or []):
+            cancel(jid)
+    except Exception:
+        pass
+    sys.exit(143)
+
+
+signal.signal(signal.SIGTERM, on_term)
+
+jid = find_active()
+if jid is not None:
+    print('adopting existing job', jid, flush=True)
+else:
+    jid = submit()
 
 open('/tmp/slurm-job-id', 'w').write(str(jid))
 TERMINAL = ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'NODE_FAIL',
             'PREEMPTED', 'OUT_OF_MEMORY')
+resubmitted = False
 while True:
     time.sleep(30)
     try:
@@ -295,6 +339,19 @@ while True:
             rc = ((job.get('exit_code') or {}).get('return_code')
                   or {}).get('number')
             print('terminal:', st, 'exit:', rc, flush=True)
+            print('job comment:', job.get('comment'), flush=True)
+            if 'FAILED' in st and rc == 231 and not resubmitted:
+                # A cache-missing pull after a LONG queue wait runs with the
+                # registry token minted at submit time — GCP tokens live 1h,
+                # so it can be stale (live job 5143859: 3.5h queue -> 231).
+                # One resubmission mints everything fresh; queue age is lost
+                # only after an actual failure.
+                resubmitted = True
+                print('pull failed - resubmitting once with fresh'
+                      ' credentials', flush=True)
+                jid = submit()
+                open('/tmp/slurm-job-id', 'w').write(str(jid))
+                continue
             sys.exit(0 if ('COMPLETED' in st and rc in (0, None)) else 1)
     except SystemExit:
         raise

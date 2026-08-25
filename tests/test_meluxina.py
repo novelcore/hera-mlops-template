@@ -219,7 +219,13 @@ def test_submit_code_stagein_and_wallet_invariants():
     assert "ZITADEL_MACHINE_KEY=" not in src  # no key material into env
     assert "MLFLOW_TRACKING_TOKEN=" in src and "LAKEFS_BEARER_TOKEN=" in src
     # stage-in: commit-keyed Lustre cache, loud failure, read-only bind
-    assert "data-cache" in src and "|| exit 232" in src
+    assert "data-cache" in src and "|| fail 232" in src
+    # failures self-diagnose into the job comment (live 5143859 was a black
+    # box); the waiter cancels a still-PENDING job on SIGTERM and resubmits
+    # once with fresh credentials on a pull failure
+    assert "fail(){ scontrol update" in src
+    assert "signal.signal(signal.SIGTERM" in src
+    assert "rc == 231 and not resubmitted" in src
     assert "/kubecore/dataset:ro" in src
     assert "APPTAINERENV_KUBECORE_DATASET_DIR" in src
     # the stage-in payload rides base64 in env and runs on system python3
