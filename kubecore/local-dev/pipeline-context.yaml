@@ -27,6 +27,9 @@ lakefs:
     secretKey: secretAccessKey
 mlflow:
   trackingUri: http://mlflow.internal.invalid
+  # externalUrl is the public ingress (PRD-1016 F-08): off-cluster runs
+  # (MeluXina Slurm jobs) reach MLflow here with a Zitadel bearer.
+  externalUrl: "https://mlflow.internal.invalid"
   svcSecret: PLACEHOLDER-mlflow-svc
   oidcDomain: "oidc.internal.invalid"
   oidcProjectId: "PLACEHOLDER-oidc-project-id"
