@@ -355,6 +355,27 @@ the first step, pre-GPU.
 
 ---
 
+### 10.1 Seed a toy dataset (first run on an empty project)
+
+A new project's lakeFS repository is empty, so the first pipeline run stops at
+`config-validation` with `dataset path not found or empty`. Generate a small,
+valid pose dataset and sync it to the ref you train on (`data.ref`, default
+`main`):
+
+```bash
+python -m tools.toy_dataset --out ./toy-dataset                       # inspect locally
+LAKEFS_ENDPOINT=https://lakefs-<project>.<cluster-domain> \
+LAKEFS_ACCESS_KEY_ID=... LAKEFS_SECRET_ACCESS_KEY=... \
+python -m tools.toy_dataset --out ./toy-dataset --upload --repo <project> --branch main
+```
+
+It lands at `dataset/main/` (the layout `config-validation` resolves:
+`s3://{repo}/{ref}/dataset/{ref}/`), replaces any previous objects under that
+prefix, and makes one commit. 28 PNGs (train 16 / val 8 / test 4) of a filled
+ellipse with its 4 extreme points as keypoints — `kpt_shape: [4, 3]`, one
+class. Enough to run every step end to end (and to actually train with
+Ultralytics); swap in your real dataset with the same layout when you have it.
+
 ## 11. Using platform tools from step code
 
 Two ways in, both zero-config:
