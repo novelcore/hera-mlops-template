@@ -231,13 +231,15 @@ git commit -m "add model-evaluation step"
 git push
 ```
 
-Now the platform takes over:
-1. **On your PR** — a `wft-render` check renders the pipeline and comments the
-   result (steps, form parameters, and a link to where it'll run). If anything's
-   wrong, the comment tells you exactly what.
-2. **On merge** — your step's image builds and gets its own `build/model-evaluation`
-   status check. The workflow template updates. Your step is now on the Argo
-   submit form, ready to run.
+Now the platform takes over — all of it in-cluster (Argo Workflows), reported
+back to GitHub as commit statuses:
+1. **On your PR** — the `wft-render` check renders the pipeline (with the real
+   cluster context) and gates the PR: steps, form parameters, and that every
+   step has a buildable Dockerfile. Its link opens the Argo run; if anything's
+   wrong, that run's log tells you exactly what.
+2. **On merge** — the `kubecore-ml-ci` check builds your step's image and
+   updates the workflow template (the `ml-ci` deployment on the commit resolves
+   to the same run). Your step is now on the Argo submit form, ready to run.
 
 You did not touch the platform. You did not write a registry URL, an image name,
 a credential, a node selector, or a resource request. You wrote a small Python

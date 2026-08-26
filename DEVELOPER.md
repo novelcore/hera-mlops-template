@@ -438,38 +438,42 @@ training run.
 
 ## 13. What CI does for you (PR checks + per-step builds)
 
-You never run the render or the image builds by hand — the repo's GitHub
-Actions do it, and report back on the commit.
+You never run the render or the image builds by hand — the platform's
+**in-cluster CI (Argo Workflows)** does it and reports back on the commit.
+There are **no GitHub Actions** in this repo, and none are needed: every
+check you see on GitHub is posted by a workflow running on the cluster, and
+its link opens that run.
 
-**On a PR to `main`** (`.github/workflows/pr-render.yml`):
+**On a PR to `dev`** (`wft-render` commit status):
 
-- The platform renders your pipeline exactly the way it will in the cluster
-  (`pipeline.py` → enhance → the release-hygiene gate) — structure only, no
-  cluster needed.
-- A **`wft-render` status check** gates the PR: green = your DAG builds, every
-  `reads=` section exists, every step is declared, no duplicate params.
-- A **PR comment** summarizes the render (steps, form-parameter count) and links
-  the **Argo Workflows UI** where the pipeline runs once merged. If the render
-  fails, the comment shows the exact error and what usually causes it — so you
-  fix it before merge, never after.
+- The platform renders your pipeline exactly the way it will after merge
+  (`pipeline.py` → enhance with the *real* cluster context → the
+  release-hygiene gate → the step ↔ folder check).
+- The **`wft-render` status check** gates the PR: green = your DAG builds,
+  every `reads=` section exists, every step is declared, every step has a
+  buildable `steps/<dir>/Dockerfile` (or a verbatim-image annotation), no
+  duplicate form params. The check's description carries the step / form-param
+  counts; its link opens the Argo run — if the render fails, the error is in
+  that run's `hera-enhance-gate` (or `hera-render`) log.
+- Nothing is written anywhere on a PR. The gate only checks.
 
-**On merge to `main`** (`.github/workflows/build-images.yml`):
+**On merge to `dev`** (`kubecore-ml-ci` commit status + `ml-ci` deployment):
 
-- Every `steps/*/` with a `Dockerfile` is built, and each gets its own
-  **`build/<step>` status check** — so you see per step which images are
-  healthy. The matrix is discovered from the folders, so a step you add gets
-  its build + check automatically, with no workflow edits.
-- This is the GitHub-side validation build. The authoritative image (kaniko →
-  the in-cluster Zot registry, wired into the WorkflowTemplate as
-  `image-<step>`) is built by the platform's in-cluster CI after merge.
+- The same render runs again and this time **commits** the rendered
+  WorkflowTemplate to the project's GitOps repo.
+- Every `steps/*/` whose contents changed is built (kaniko → the platform
+  registry) and wired into the WorkflowTemplate as `image-<step>`. The matrix
+  is discovered from the folders, so a step you add gets built automatically,
+  with no CI edits.
+- One **`kubecore-ml-ci`** status on the commit (pending → success/failure,
+  link = the Argo build run) and one GitHub **Deployment** (`ml-ci`) that
+  resolves to the same run. A missed webhook is caught within ~3 minutes by
+  the platform's reconciler — no build is ever lost.
 
 So the whole loop for adding a step (§5) is: add `steps/<name>/` + a config
-section + one `pipeline.py` line → **commit** → the PR check renders your WFT
-and comments the result → merge → your step image builds (its own check) → the
-WorkflowTemplate is ready to run in the Argo UI.
-
-> To make the PR comment link your cluster's Argo UI, set the repo variable
-> `ARGO_UI_URL` (Settings → Secrets and variables → Actions → Variables).
+section + one `pipeline.py` line → **open a PR** → `wft-render` renders your
+WFT → merge → `kubecore-ml-ci` builds your step image and updates the
+WorkflowTemplate → it is ready to run in the Argo UI.
 
 ---
 
