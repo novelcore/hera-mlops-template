@@ -153,6 +153,48 @@ def mint_wallet():
         print('wallet: mint failed, data-plane env omitted:', e, flush=True)
         return ''
 
+# OCI WORKDIR (live job 5148071): Docker honours the image's WorkingDir,
+# Apptainer does NOT — `apptainer exec` starts in the host cwd, so a step
+# command like `python -m app.entry` fails with "No module named 'app'".
+# Step images use different WORKDIRs (/app, /work), so it is read from the
+# image config in the registry at submit time and passed as `--pwd`.
+# Best-effort: any failure yields '' (no --pwd), never a blocked submit.
+def fetch_workdir(image, reg_token):
+    try:
+        ref_host, _, rest = image.partition('/')
+        if '@' in rest:
+            path, ref = rest.split('@', 1)
+        elif ':' in rest.rsplit('/', 1)[-1]:
+            path, ref = rest.rsplit(':', 1)
+        else:
+            path, ref = rest, 'latest'
+        hdr = {'Accept': ', '.join([
+            'application/vnd.oci.image.index.v1+json',
+            'application/vnd.docker.distribution.manifest.list.v2+json',
+            'application/vnd.oci.image.manifest.v1+json',
+            'application/vnd.docker.distribution.manifest.v2+json'])}
+        if reg_token and ref_host.endswith('-docker.pkg.dev'):
+            hdr['Authorization'] = 'Bearer ' + reg_token
+        base = 'https://' + ref_host + '/v2/' + path
+
+        def get(url):
+            return json.load(urllib.request.urlopen(
+                urllib.request.Request(url, headers=hdr), timeout=20))
+        m = get(base + '/manifests/' + ref)
+        if 'manifests' in m:  # multi-arch index: pick linux/amd64
+            pick = next((x for x in m['manifests']
+                         if (x.get('platform') or {}).get('architecture') == 'amd64'
+                         and (x.get('platform') or {}).get('os', 'linux') == 'linux'),
+                        m['manifests'][0])
+            m = get(base + '/manifests/' + pick['digest'])
+        cfg = get(base + '/blobs/' + m['config']['digest'])
+        wd = (cfg.get('config') or {}).get('WorkingDir') or ''
+        print('workdir:', wd or '(none)', flush=True)
+        return wd
+    except Exception as e:
+        print('workdir: lookup failed (running from host cwd):', e, flush=True)
+        return ''
+
 API = 'https://slurm-api.lxp.lu/slurm/v0.0.44'
 SDB = 'https://slurm-api.lxp.lu/slurmdb/v0.0.44'
 TOK = os.environ['SLURM_TOKEN'].strip()
@@ -251,15 +293,17 @@ def submit():
         ' APPTAINER_DOCKER_PASSWORD=$REG_TOKEN;; esac',
         '  apptainer pull "$SIF" docker://$IMAGE_REF || fail 231',
         'fi',
-        'if [ -n "$STEP_CMD" ]; then apptainer exec --nv $BIND "$SIF"'
-        ' /bin/sh -c "$STEP_CMD"; else apptainer exec --nv $BIND "$SIF"'
+        # Start in the image's WORKDIR (Apptainer ignores it; Docker does not).
+        'PWD_OPT=""; [ -n "$STEP_WORKDIR" ] && PWD_OPT="--pwd $STEP_WORKDIR"',
+        'if [ -n "$STEP_CMD" ]; then apptainer exec --nv $PWD_OPT $BIND "$SIF"'
+        ' /bin/sh -c "$STEP_CMD"; else apptainer exec --nv $PWD_OPT $BIND "$SIF"'
         ' nvidia-smi -L; fi',
         'rc=$?; [ $rc -ne 0 ] && fail $rc',
         'exit 0',
     ])
     env = ['PATH=/usr/bin:/bin:/usr/local/bin', 'HOME=/home/users/u104378',
            'USER=u104378', 'IMAGE_REF=' + img, 'REG_TOKEN=' + reg,
-           'STEP_CMD=' + cmd]
+           'STEP_CMD=' + cmd, 'STEP_WORKDIR=' + fetch_workdir(img, reg)]
     wallet = mint_wallet()
     if wallet:
         # Public endpoints only, short-lived bearer only (T-03). MLflow's

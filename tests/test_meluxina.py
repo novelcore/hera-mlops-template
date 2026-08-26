@@ -228,6 +228,8 @@ def test_submit_code_stagein_and_wallet_invariants():
     assert "rc == 231 and not resubmitted" in src
     assert "/kubecore/dataset:ro" in src
     assert "APPTAINERENV_KUBECORE_DATASET_DIR" in src
+    # the step runs from the image WORKDIR (Apptainer ignores it otherwise)
+    assert 'PWD_OPT="--pwd $STEP_WORKDIR"' in src and "STEP_WORKDIR=" in src
     # the stage-in payload rides base64 in env and runs on system python3
     assert "STAGEIN_B64" in src and "base64 -d" in src
     # no Argo tags anywhere in the program (survives templating verbatim)
@@ -265,3 +267,39 @@ def test_cmd_json_mixed_and_literal_tokens():
     assert out2 == ('["--params", '
                     "{{=toJson(tasks['compose-and-validate']"
                     ".outputs.parameters.params)}}]")
+
+
+def test_fetch_workdir_reads_oci_config_via_index(monkeypatch):
+    """Apptainer ignores the image WORKDIR (live job 5148071: python -m
+    app.entry ran from the host cwd -> 'No module named app'). The submit
+    code resolves WorkingDir from the registry: index -> amd64 manifest ->
+    config blob; GAR gets the bearer, and any failure degrades to ''."""
+    import io, json as _json, urllib.request
+    from kubecore.meluxina import MELUXINA_SUBMIT_CODE
+    g = {}
+    exec(MELUXINA_SUBMIT_CODE.split("API = ")[0], g)
+    calls = []
+    def fake_urlopen(req, timeout=0):
+        calls.append((req.full_url, req.headers.get("Authorization")))
+        u = req.full_url
+        if u.endswith("/manifests/sha256:img"):
+            body = {"manifests": [
+                {"digest": "sha256:arm", "platform": {"architecture": "arm64", "os": "linux"}},
+                {"digest": "sha256:amd", "platform": {"architecture": "amd64", "os": "linux"}}]}
+        elif u.endswith("/manifests/sha256:amd"):
+            body = {"config": {"digest": "sha256:cfg"}}
+        elif u.endswith("/blobs/sha256:cfg"):
+            body = {"config": {"WorkingDir": "/app"}}
+        else:
+            raise AssertionError(u)
+        return io.BytesIO(_json.dumps(body).encode())
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    wd = g["fetch_workdir"]("europe-central2-docker.pkg.dev/proj/repo/unknown@sha256:img", "tok")
+    assert wd == "/app"
+    assert calls[0][0] == "https://europe-central2-docker.pkg.dev/v2/proj/repo/unknown/manifests/sha256:img"
+    assert all(a == "Bearer tok" for _, a in calls)  # GAR host -> bearer on every call
+    # tag refs and failures
+    def boom(req, timeout=0):
+        raise OSError("registry down")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    assert g["fetch_workdir"]("zot.internal:5000/unknown:v1", "") == ""
