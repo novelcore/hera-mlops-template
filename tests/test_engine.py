@@ -532,3 +532,29 @@ def test_disk_request_beyond_boot_disk_fails_render():
         assert False, "500Gi disk on a 50GB boot-disk class should fail the render"
     except enhance.EnhanceError as e:
         assert "ephemeral-storage" in str(e) and "boot" in str(e)
+
+
+def test_cpu_only_environment_routes_gpu_steps_to_cpu_default():
+    """PRD-1124 D-02: an ml environment may declare cpu flavours only. A gpu-
+    declaring step must then default to the cpu class (it runs CPU-only via
+    the gpus routing) instead of crashing on the missing gpu tier — the
+    KeyError that broke every CI render of a cpu-only environment."""
+    import copy
+
+    ctx = copy.deepcopy(CONTEXT)
+    ctx["computeClasses"].pop("gpu", None)
+    ctx["computeClasses"]["all"] = [c for c in ctx["computeClasses"]["all"] if c.get("tier") != "gpu"]
+    cpu_default = ctx["computeClasses"]["cpu"]["name"]
+    wft = enhance.enhance(_render(), ctx, CATALOG)
+    params = {p["name"]: p for p in wft["spec"]["arguments"]["parameters"]}
+    assert params["model-training-class"]["value"] == cpu_default
+    assert cpu_default in params["model-training-class"]["enum"]
+
+    ctx["computeClasses"].pop("cpu", None)
+    ctx["computeClasses"]["all"] = []
+    try:
+        enhance.enhance(_render(), ctx, CATALOG)
+    except enhance.EnhanceError as e:
+        assert "declares no compute flavours" in str(e)
+    else:
+        raise AssertionError("an environment with no flavours must fail loudly")
