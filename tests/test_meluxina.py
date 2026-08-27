@@ -370,3 +370,60 @@ def test_authoring_hpc_time_limit_validation():
     with pytest.raises(AuthoringError):
         with pipeline("t"):
             step("prep", hpc_time_limit="1h")  # cpu steps never route to HPC
+
+
+# ---------------------------------------------------------------- F-05 stage-out
+
+
+def _raw_with_outputs():
+    raw = _raw()
+    tpl = next(t for t in raw["spec"]["templates"] if t["name"] == "model-training")
+    tpl["outputs"] = {"parameters": [
+        {"name": "training-result", "valueFrom": {"path": "/work/output/training-result.json", "default": "{}"}}]}
+    dag = next(t for t in raw["spec"]["templates"] if t["name"] == "p")
+    reg = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-registration")
+    reg["arguments"] = {"parameters": [
+        {"name": "training-result", "value": "{{tasks.model-training.outputs.parameters.training-result}}"},
+        {"name": "params", "value": "{{tasks.dataset-loading.outputs.parameters.params}}"}]}
+    return raw
+
+
+def test_stage_out_declares_step_outputs_on_the_runner_and_twin():
+    out = enhance(_raw_with_outputs(), _ctx())
+    run = next(t for t in out["spec"]["templates"] if t["name"] == "meluxina-run")
+    outs = {o["name"]: o for o in run["outputs"]["parameters"]}
+    assert "slurm-job-id" in outs
+    assert outs["training-result"]["valueFrom"] == {"path": "/tmp/outputs/training-result.json", "default": "{}"}
+    dag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
+    twin = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-training-meluxina")
+    args = {p["name"]: p["value"] for p in twin["arguments"]["parameters"]}
+    assert args["step-outputs"] == "training-result"
+    qat_twin = next(t for t in dag["dag"]["tasks"] if t["name"] == "qat-finetune-meluxina")
+    assert {p["name"]: p["value"] for p in qat_twin["arguments"]["parameters"]}["step-outputs"] == ""
+    env = {e["name"]: e.get("value") for e in run["container"]["env"]}
+    assert env["STEP_OUTPUTS"] == "{{inputs.parameters.step-outputs}}"
+
+
+def test_stage_out_rewrites_downstream_references_to_the_twin_that_ran():
+    out = enhance(_raw_with_outputs(), _ctx())
+    dag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
+    reg = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-registration")
+    args = {p["name"]: p["value"] for p in reg["arguments"]["parameters"]}
+    assert args["training-result"] == (
+        "{{=tasks['model-training'].status == 'Skipped' ? "
+        "tasks['model-training-meluxina'].outputs.parameters['training-result'] : "
+        "tasks['model-training'].outputs.parameters['training-result']}}")
+    # references to un-routed steps are left alone
+    assert args["params"] == "{{tasks.dataset-loading.outputs.parameters.params}}"
+
+
+def test_stage_out_batch_and_waiter_invariants():
+    from kubecore.meluxina import MELUXINA_SUBMIT_CODE as code
+    import ast, re
+    assert "-B $KAOS_WORK:/work" in code                      # writable /work for the step
+    assert 'rm -rf "$KAOS_WORK"' in code and "[ $rc -eq 0 ] && rm -rf" in code  # scratch kept on failure
+    assert "STAGEOUT_B64" in code and "STEP_OUTPUTS" in code
+    assert "fetch_outputs()" in code and "/tmp/outputs/" in code
+    stageout = re.search(r'STAGEOUT = """\n(.*?)"""', code, re.S).group(1)
+    ast.parse(stageout)
+    assert "hpc-outputs/" in stageout and "branches/%s/objects" in stageout
