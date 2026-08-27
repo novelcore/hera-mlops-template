@@ -188,8 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--branch", default="main", help="lakeFS branch = the data.ref you train on")
     ap.add_argument("--prefix", default=None,
                     help="object prefix under the branch (default dataset/{branch}/ — the "
-                         "hera-mlops-template layout; the official yolo-pipelines template is "
-                         "ref-native: pass --prefix dataset/)")
+                         "platform standard {ref}/dataset/{version}/ with version = ref)")
     ap.add_argument("--endpoint", default=os.environ.get("LAKEFS_ENDPOINT"),
                     help="lakeFS API endpoint (default: $LAKEFS_ENDPOINT)")
     args = ap.parse_args(argv)
