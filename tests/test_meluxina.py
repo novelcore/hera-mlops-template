@@ -303,3 +303,70 @@ def test_fetch_workdir_reads_oci_config_via_index(monkeypatch):
         raise OSError("registry down")
     monkeypatch.setattr(urllib.request, "urlopen", boom)
     assert g["fetch_workdir"]("zot.internal:5000/unknown:v1", "") == ""
+
+
+# ---------------------------------------------------------------- time limit
+
+
+def test_parse_time_limit_units():
+    from kubecore.meluxina import parse_time_limit
+    assert parse_time_limit("90") == 90
+    assert parse_time_limit("90m") == 90
+    assert parse_time_limit("12h") == 720
+    import pytest
+    for bad in ("", "0", "1d", "abc", "12 h"):
+        with pytest.raises(ValueError):
+            parse_time_limit(bad)
+
+
+def _rendered_twin(annotation=None):
+    from kubecore.meluxina import HPC_ANNOTATION
+    raw = _raw()
+    if annotation is not None:
+        for t in raw["spec"]["templates"]:
+            if t["name"] == "model-training":
+                t.setdefault("metadata", {}).setdefault("annotations", {})[HPC_ANNOTATION] = annotation
+    out = enhance(copy.deepcopy(raw), yaml.safe_load(CTX_PATH.read_text()))
+    dag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
+    twin = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-training-meluxina")
+    run = next(t for t in out["spec"]["templates"] if t["name"] == "meluxina-run")
+    return {p["name"]: p["value"] for p in twin["arguments"]["parameters"]}, run
+
+
+def test_twin_carries_default_time_limit_and_deadline():
+    from kubecore.meluxina import DEFAULT_TIME_LIMIT_MINUTES, QUEUE_ALLOWANCE_MINUTES
+    args, run = _rendered_twin()
+    assert args["time-limit"] == str(DEFAULT_TIME_LIMIT_MINUTES)
+    assert args["deadline-seconds"] == str((DEFAULT_TIME_LIMIT_MINUTES + QUEUE_ALLOWANCE_MINUTES) * 60)
+    # the template resolves the per-twin deadline and hands the limit to Slurm
+    assert run["activeDeadlineSeconds"] == "{{inputs.parameters.deadline-seconds}}"
+    names = {p["name"] for p in run["inputs"]["parameters"]}
+    assert {"time-limit", "deadline-seconds"} <= names
+    env = {e["name"]: e.get("value") for e in run["container"]["env"]}
+    assert env["SLURM_TIME_LIMIT"] == "{{inputs.parameters.time-limit}}"
+    assert "SLURM_TIME_LIMIT" in run["container"]["command"][2]
+
+
+def test_twin_honours_step_time_limit_annotation():
+    from kubecore.meluxina import QUEUE_ALLOWANCE_MINUTES
+    args, _ = _rendered_twin("12h")
+    assert args["time-limit"] == "720"
+    assert args["deadline-seconds"] == str((720 + QUEUE_ALLOWANCE_MINUTES) * 60)
+
+
+def test_bad_time_limit_annotation_fails_the_render():
+    import pytest
+    with pytest.raises(ValueError):
+        _rendered_twin("1d")
+
+
+def test_authoring_hpc_time_limit_validation():
+    import pytest
+    from kubecore.authoring import AuthoringError, pipeline, step
+    for bad in ("1d", 720, "12 h"):
+        with pytest.raises(AuthoringError):
+            with pipeline("t"):
+                step("train", gpu=True, hpc_time_limit=bad)
+    with pytest.raises(AuthoringError):
+        with pipeline("t"):
+            step("prep", hpc_time_limit="1h")  # cpu steps never route to HPC
