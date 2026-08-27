@@ -219,6 +219,27 @@ def is_gpu_step(step: dict) -> bool:
     )
 
 
+def step_tier(step: dict) -> str:
+    return "gpu" if is_gpu_step(step) else "cpu"
+
+
+def tier_default(ctx: dict, step: dict) -> dict:
+    """The class a step defaults to: its own tier's default, else the OTHER
+    tier's (an ml environment may declare only cpu or only gpu flavours —
+    PRD-1124 D-02 — and a gpu-declaring step submitted with a cpu class
+    legitimately runs CPU-only, see enhance_gpu_routing). Neither tier
+    present is an authoring error: the environment declares no compute."""
+    classes = ctx["computeClasses"]
+    tier = step_tier(step)
+    for candidate in (tier, "cpu" if tier == "gpu" else "gpu"):
+        if classes.get(candidate):
+            return classes[candidate]
+    raise EnhanceError(
+        f"step '{step['name']}': the target ml environment declares no compute flavours "
+        f"(environments[].ml.cpu / .gpu are both empty) — add at least one"
+    )
+
+
 def default_class_name(step: dict, ctx: dict, annots: dict) -> str:
     """The step's default compute class name: a pinned compute-class
     annotation wins, else the pool's gpu/cpu tier default."""
@@ -230,8 +251,7 @@ def default_class_name(step: dict, ctx: dict, annots: dict) -> str:
                 f"step '{step['name']}': compute-class '{pinned}' not in pool catalog ({known})"
             )
         return pinned
-    tier = "gpu" if is_gpu_step(step) else "cpu"
-    return ctx["computeClasses"][tier]["name"]
+    return tier_default(ctx, step)["name"]
 
 
 def resolve_compute_class(step: dict, ctx: dict, annots: dict) -> dict:
@@ -240,10 +260,10 @@ def resolve_compute_class(step: dict, ctx: dict, annots: dict) -> dict:
     name = default_class_name(step, ctx, annots)
     for cls in ctx["computeClasses"]["all"]:
         if cls["name"] == name:
-            tier_default = ctx["computeClasses"][cls.get("tier", "gpu" if is_gpu_step(step) else "cpu")]
-            return {**tier_default, **cls}
+            base = ctx["computeClasses"].get(cls.get("tier", step_tier(step))) or tier_default(ctx, step)
+            return {**base, **cls}
     # tier default itself (name came straight from computeClasses.{cpu,gpu})
-    return ctx["computeClasses"]["gpu" if is_gpu_step(step) else "cpu"]
+    return tier_default(ctx, step)
 
 
 def catalog_toleration_pairs(ctx: dict, step: dict, annots: dict) -> list:
@@ -362,8 +382,8 @@ def enhance_class_param(spec: dict, step: dict, ctx: dict, annots: dict) -> None
     param_name = f"{step_name}-class"
     if param_name in existing:
         return
-    tier = "gpu" if is_gpu_step(step) else "cpu"
-    default = ctx["computeClasses"][tier]["name"]
+    tier = step_tier(step)
+    default = tier_default(ctx, step)["name"]
     # Full pool catalog, ALL tiers, ALWAYS attached (#865): the old
     # tier-filtered list collapsed to length 1 on a one-class-per-tier pool,
     # and enum-only-when->1 then rendered a FREE-TEXT box (typo -> forever-
@@ -485,9 +505,22 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
     ml_env = ctx.get("mlEnvironment") or {}
     ml_env_name = (ml_env.get("name") or "").strip()
     if ml_env_name:
-        step["nodeSelector"].setdefault(
-            "platform.kubecore.io/environment", ml_env_name
-        )
+        # The operator's selector is the authority (PRD-1124): project +
+        # environment, plus app for an APP-dedicated ml environment (D-07,
+        # spec.dedicatedEnvironment.ml → app-tainted pools). Copy it verbatim
+        # so the keys never drift from what kubenv-gcp stamps on the pools;
+        # fall back to the legacy project/environment pair for a context
+        # that predates the map (pipeline-context rendered by an older
+        # operator). Project scoping is load-bearing either way: environment
+        # names repeat across projects (live cross-tenant leak, 2026-08-27).
+        selector = ml_env.get("nodeSelector") or {}
+        if not selector:
+            selector = {"platform.kubecore.io/environment": ml_env_name}
+            project = (ctx.get("project") or "").strip()
+            if project:
+                selector["platform.kubecore.io/project"] = project
+        for key, value in selector.items():
+            step["nodeSelector"].setdefault(key, value)
 
     # Bound how long this step may sit unschedulable (see the constants above).
     # fill-absent: a developer who set their own deadline keeps it.
@@ -515,19 +548,21 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
         # GKE auto-taints accelerator nodes; tolerate it so the pod schedules.
         # Harmless on CPU nodes (tolerations never attract, only permit).
         tolerations.append({"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"})
-    if ml_env_name and not any(
-        t.get("key") == "platform.kubecore.io/kubenv" for t in tolerations
-    ):
-        # PRD-858: the env pools carry the kubenv env-exclusivity taint;
-        # without this toleration every step Pends forever on its own pools.
-        tolerations.append(
-            {
-                "key": "platform.kubecore.io/kubenv",
-                "operator": "Equal",
-                "value": ml_env_name,
-                "effect": "NoSchedule",
-            }
-        )
+    if ml_env_name:
+        # The pools carry the env-exclusivity taint (kubenv={env}) — or the
+        # app-exclusivity taint (app={app}) for a dedicated ml environment
+        # (D-07); the operator's mlEnvironment.tolerations says which. Without
+        # it every step Pends forever on its own pools (PRD-858).
+        env_tolerations = ml_env.get("tolerations") or [
+            {"key": "platform.kubecore.io/kubenv", "operator": "Equal",
+             "value": ml_env_name, "effect": "NoSchedule"}
+        ]
+        for tol in env_tolerations:
+            if not any(t.get("key") == tol.get("key") and t.get("value") == tol.get("value") for t in tolerations):
+                tolerations.append({
+                    "key": tol.get("key"), "operator": tol.get("operator", "Equal"),
+                    "value": tol.get("value"), "effect": tol.get("effect", "NoSchedule"),
+                })
 
     # Sizing. Developer-set requests always win; a missing limit mirrors the
     # (possibly developer-set) request. Only fields the developer left entirely
@@ -578,7 +613,7 @@ def _parse_mem_gib(value) -> float:
     return float(text) / 1024**3  # bare bytes
 
 
-def validate_scheduling(step: dict, compute_class: dict, gpu: bool = None) -> None:
+def validate_scheduling(step: dict, compute_class: dict, gpu: bool = None, env_has_gpu: bool = True) -> None:
     """Fail the render if this step can NEVER schedule on its compute class.
 
     The step's requests are compared against the class's whole-node budget
@@ -625,7 +660,12 @@ def validate_scheduling(step: dict, compute_class: dict, gpu: bool = None) -> No
                 f"but compute class '{class_name}' ({machine}) has only a {disk_size_gb}GB boot "
                 f"disk — the pod would never schedule. Lower disk= or pick a bigger class."
             )
-    if (is_gpu_step(step) if gpu is None else gpu) and not compute_class.get("guestAccelerator"):
+    # A gpu-declaring step on an accelerator-less class can never schedule —
+    # unless the target ml environment declares NO gpu flavours at all
+    # (PRD-1124 D-02: cpu-only environment). Then the step defaults to the cpu
+    # class and the gpus routing (enhance_gpu_routing) sets its nvidia.com/gpu
+    # request to 0, so it schedules and runs CPU-only by design.
+    if (is_gpu_step(step) if gpu is None else gpu) and env_has_gpu and not compute_class.get("guestAccelerator"):
         raise EnhanceError(
             f"step '{step_name}' requests a GPU but compute class '{class_name}' "
             f"({machine}) has no accelerator — the pod would never schedule."
@@ -887,7 +927,7 @@ def enhance(wft: dict, ctx: dict, catalog: dict = None) -> dict:
         enhance_scheduling(step, ctx, annots)
         # After scheduling fill, so the final requests (developer-set or
         # platform whole-node) are what get checked against the class budget.
-        validate_scheduling(step, compute_class, gpu)
+        validate_scheduling(step, compute_class, gpu, env_has_gpu=bool(gpu_class_names(ctx)))
         # After validation: strips the typed GPU request and installs the
         # runtime class->gpus routing (#865), so the checks above still saw
         # the full gpu-tier picture.

@@ -532,3 +532,80 @@ def test_disk_request_beyond_boot_disk_fails_render():
         assert False, "500Gi disk on a 50GB boot-disk class should fail the render"
     except enhance.EnhanceError as e:
         assert "ephemeral-storage" in str(e) and "boot" in str(e)
+
+
+def test_cpu_only_environment_routes_gpu_steps_to_cpu_default():
+    """PRD-1124 D-02: an ml environment may declare cpu flavours only. A gpu-
+    declaring step must then default to the cpu class (it runs CPU-only via
+    the gpus routing) instead of crashing on the missing gpu tier — the
+    KeyError that broke every CI render of a cpu-only environment."""
+    import copy
+
+    ctx = copy.deepcopy(CONTEXT)
+    ctx["computeClasses"].pop("gpu", None)
+    ctx["computeClasses"]["all"] = [c for c in ctx["computeClasses"]["all"] if c.get("tier") != "gpu"]
+    cpu_default = ctx["computeClasses"]["cpu"]["name"]
+    wft = enhance.enhance(_render(), ctx, CATALOG)
+    params = {p["name"]: p for p in wft["spec"]["arguments"]["parameters"]}
+    assert params["model-training-class"]["value"] == cpu_default
+    assert cpu_default in params["model-training-class"]["enum"]
+
+    ctx["computeClasses"].pop("cpu", None)
+    ctx["computeClasses"]["all"] = []
+    try:
+        enhance.enhance(_render(), ctx, CATALOG)
+    except enhance.EnhanceError as e:
+        assert "declares no compute flavours" in str(e)
+    else:
+        raise AssertionError("an environment with no flavours must fail loudly")
+
+
+def test_ml_environment_selector_is_project_scoped():
+    """PRD-1124 tenancy: with an mlEnvironment, every step's nodeSelector
+    carries platform.kubecore.io/project alongside the environment label —
+    environment names repeat across projects, so without it a step schedules
+    onto another tenant's same-named env pool (live, 2026-08-27)."""
+    import copy
+
+    ctx = copy.deepcopy(CONTEXT)
+    ctx["mlEnvironment"] = {"name": "training", "namespace": f"{ctx['project']}-training"}
+    wft = enhance.enhance(_render(), ctx, CATALOG)
+    checked = 0
+    for t in wft["spec"]["templates"]:
+        # only in-cluster step templates carry a nodeSelector (the MeluXina
+        # submit leg runs off-cluster and has none)
+        if "container" not in t or not t.get("nodeSelector"):
+            continue
+        sel = t["nodeSelector"]
+        assert sel.get("platform.kubecore.io/environment") == "training", t["name"]
+        assert sel.get("platform.kubecore.io/project") == ctx["project"], (t["name"], sel)
+        checked += 1
+    assert checked > 0
+
+
+def test_dedicated_ml_environment_uses_operator_selector_and_app_taint():
+    """PRD-1124 D-07: for an app-dedicated ml environment the operator's
+    mlEnvironment block carries the app key and the app-exclusivity toleration;
+    the enhancer must copy both verbatim and NOT add the kubenv taint."""
+    import copy
+
+    ctx = copy.deepcopy(CONTEXT)
+    ctx["mlEnvironment"] = {
+        "name": "training", "namespace": f"{ctx['project']}-yolo--training",
+        "nodeSelector": {"platform.kubecore.io/project": ctx["project"],
+                         "platform.kubecore.io/environment": "training",
+                         "platform.kubecore.io/app": "yolo"},
+        "tolerations": [{"key": "platform.kubecore.io/app", "operator": "Equal",
+                         "value": "yolo", "effect": "NoSchedule"}],
+    }
+    wft = enhance.enhance(_render(), ctx, CATALOG)
+    checked = 0
+    for t in wft["spec"]["templates"]:
+        if "container" not in t or not t.get("nodeSelector"):
+            continue
+        assert t["nodeSelector"].get("platform.kubecore.io/app") == "yolo", t["name"]
+        keys = {x.get("key"): x.get("value") for x in t.get("tolerations", [])}
+        assert keys.get("platform.kubecore.io/app") == "yolo", (t["name"], keys)
+        assert "platform.kubecore.io/kubenv" not in keys, (t["name"], keys)
+        checked += 1
+    assert checked > 0
