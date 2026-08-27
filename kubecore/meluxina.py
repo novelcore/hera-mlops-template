@@ -141,6 +141,23 @@ print('stage-in: downloaded', n, 'of', len(objs), '->', dest, flush=True)
 # omitted) — never the machine key itself into the Slurm environment
 # (T-03: HPC-side env must only ever see short-lived tokens).
 WALLET = None
+WALLET_EXP = 0.0
+# Resubmit a still-PENDING job before its wallet (MLflow/lakeFS bearer, 12 h
+# lifetime) expires: a job that starts after a queue wait longer than the
+# wallet would train blind (no MLflow, no checkpoint upload, no stage-out).
+# The Slurm JWT is read fresh per request (tok()); the wallet cannot be
+# refreshed inside a queued job, so the job itself is replaced.
+WALLET_MARGIN_S = 30 * 60
+
+
+def wallet_exp(w):
+    """exp claim of a JWT as epoch seconds (0 when unknown)."""
+    try:
+        seg = w.split('.')[1]
+        return float(json.loads(base64.urlsafe_b64decode(
+            seg + '=' * (-len(seg) % 4)))['exp'])
+    except Exception:
+        return 0.0
 
 
 def mint_wallet():
@@ -365,8 +382,9 @@ def submit():
            'WF_UID=' + (os.environ.get('WF_UID') or ''),
            'STEP_NAME=' + (os.environ.get('STEP_NAME') or ''),
            'STEP_OUTPUTS=' + (os.environ.get('STEP_OUTPUTS') or '')]
-    global WALLET
+    global WALLET, WALLET_EXP
     wallet = WALLET = mint_wallet()
+    WALLET_EXP = wallet_exp(wallet)
     if wallet:
         # Public endpoints only, short-lived bearer only (T-03). MLflow's
         # client honors MLFLOW_TRACKING_TOKEN natively; the stage-in and any
@@ -463,27 +481,43 @@ def fetch_outputs():
 
 TERMINAL = ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'NODE_FAIL',
             'PREEMPTED', 'OUT_OF_MEMORY')
-resubmitted = False
+# The registry pull token (GCE metadata, 1 h) is minted at submit time and
+# cannot be refreshed inside a queued job, so every queue wait longer than an
+# hour costs one failed pull (exit 231) and a resubmission. Bounded, not
+# once: a second long wait after the first resubmit must not strand the run.
+PULL_RESUBMITS = 3
+resubmits = 0
 while True:
     time.sleep(30)
     try:
         job = (get(SDB + '/job/' + str(jid)).get('jobs') or [{}])[0]
         st = (job.get('state') or {}).get('current') or []
         print('state:', st, flush=True)
+        if ('PENDING' in st and WALLET_EXP
+                and time.time() > WALLET_EXP - WALLET_MARGIN_S):
+            print('wallet expires within', WALLET_MARGIN_S // 60,
+                  'min and the job is still queued - resubmitting with a'
+                  ' fresh wallet (queue position is lost, credentials are'
+                  ' not)', flush=True)
+            cancel(jid)
+            jid = submit()
+            open('/tmp/slurm-job-id', 'w').write(str(jid))
+            continue
         if any(x in TERMINAL for x in st):
             rc = ((job.get('exit_code') or {}).get('return_code')
                   or {}).get('number')
             print('terminal:', st, 'exit:', rc, flush=True)
             print('job comment:', job.get('comment'), flush=True)
-            if 'FAILED' in st and rc == 231 and not resubmitted:
+            if 'FAILED' in st and rc == 231 and resubmits < PULL_RESUBMITS:
                 # A cache-missing pull after a LONG queue wait runs with the
                 # registry token minted at submit time — GCP tokens live 1h,
-                # so it can be stale (live job 5143859: 3.5h queue -> 231).
-                # One resubmission mints everything fresh; queue age is lost
-                # only after an actual failure.
-                resubmitted = True
-                print('pull failed - resubmitting once with fresh'
-                      ' credentials', flush=True)
+                # so it can be stale (live job 5143859: 3.5h queue -> 231;
+                # 5150371: 65 min queue -> 231). Resubmitting mints
+                # everything fresh; queue age is lost only after an actual
+                # failure.
+                resubmits += 1
+                print('pull failed - resubmitting with fresh credentials'
+                      ' (%d/%d)' % (resubmits, PULL_RESUBMITS), flush=True)
                 jid = submit()
                 open('/tmp/slurm-job-id', 'w').write(str(jid))
                 continue
@@ -705,6 +739,11 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
         # Per-step: Slurm time limit + queue/prep allowance (see
         # QUEUE_ALLOWANCE_MINUTES). Argo resolves the parameter here.
         "activeDeadlineSeconds": "{{inputs.parameters.deadline-seconds}}",
+        # A lost waiter pod (node preemption, eviction) is an Error, not a
+        # step failure: retry it — find_active() adopts the Slurm job by its
+        # workflow-uid name, so a retried waiter re-attaches instead of
+        # submitting a duplicate.
+        "retryStrategy": {"limit": "2", "retryPolicy": "OnError"},
         "metadata": {"labels": {"platform.kubecore.io/compute-type": "hpc"}},
         "volumes": [{"name": "mlflow-svc", "secret": {
             "secretName": str(mlflow_ctx.get("svcSecret") or "mlflow-svc"),
