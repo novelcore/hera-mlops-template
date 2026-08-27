@@ -386,9 +386,10 @@ LAKEFS_ACCESS_KEY_ID=... LAKEFS_SECRET_ACCESS_KEY=... \
 python -m tools.toy_dataset --out ./toy-dataset --upload --repo <project> --branch main
 ```
 
-It lands at `dataset/main/` (the layout `config-validation` resolves:
-`s3://{repo}/{ref}/dataset/{ref}/`), replaces any previous objects under that
-prefix, and makes one commit. 28 PNGs (train 16 / val 8 / test 4) of a filled
+It lands at `dataset/main/` (the layout this template's `config-validation`
+resolves: `s3://{repo}/{ref}/dataset/{ref}/`), replaces any previous objects under
+that prefix, and makes one commit. The official `yolo-pipelines` template is
+ref-native (`s3://{repo}/{ref}/dataset/`): pass `--prefix dataset/` there. 28 PNGs (train 16 / val 8 / test 4) of a filled
 ellipse with its 4 extreme points as keypoints — `kpt_shape: [4, 3]`, one
 class. Enough to run every step end to end (and to actually train with
 Ultralytics); swap in your real dataset with the same layout when you have it.
