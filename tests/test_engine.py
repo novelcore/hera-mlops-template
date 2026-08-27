@@ -558,3 +558,21 @@ def test_cpu_only_environment_routes_gpu_steps_to_cpu_default():
         assert "declares no compute flavours" in str(e)
     else:
         raise AssertionError("an environment with no flavours must fail loudly")
+
+
+def test_ml_environment_selector_is_project_scoped():
+    """PRD-1124 tenancy: with an mlEnvironment, every step's nodeSelector
+    carries platform.kubecore.io/project alongside the environment label —
+    environment names repeat across projects, so without it a step schedules
+    onto another tenant's same-named env pool (live, 2026-08-27)."""
+    import copy
+
+    ctx = copy.deepcopy(CONTEXT)
+    ctx["mlEnvironment"] = {"name": "training", "namespace": f"{ctx['project']}-training"}
+    wft = enhance.enhance(_render(), ctx, CATALOG)
+    for t in wft["spec"]["templates"]:
+        if "container" not in t:
+            continue
+        sel = t.get("nodeSelector", {})
+        assert sel.get("platform.kubecore.io/environment") == "training", t["name"]
+        assert sel.get("platform.kubecore.io/project") == ctx["project"], (t["name"], sel)

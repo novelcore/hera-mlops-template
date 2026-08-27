@@ -505,6 +505,13 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
     ml_env = ctx.get("mlEnvironment") or {}
     ml_env_name = (ml_env.get("name") or "").strip()
     if ml_env_name:
+        # PROJECT-scoped (PRD-1124): environment names repeat across projects,
+        # so two "training" envs with a cpu-small flavour label their pools
+        # identically apart from platform.kubecore.io/project — without it a
+        # step lands on another tenant's pool (live 2026-08-27).
+        project = (ctx.get("project") or "").strip()
+        if project:
+            step["nodeSelector"].setdefault("platform.kubecore.io/project", project)
         step["nodeSelector"].setdefault(
             "platform.kubecore.io/environment", ml_env_name
         )
