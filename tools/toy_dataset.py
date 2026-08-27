@@ -165,7 +165,11 @@ class LakeFS:
 def sync(client: LakeFS, files: dict[str, bytes], prefix: str) -> tuple[int, int, str]:
     """Upload ``files`` under ``prefix``, delete remote-only objects, commit."""
     wanted = {prefix + rel: data for rel, data in files.items()}
-    stale = [p for p in client.list(prefix) if p not in wanted]
+    # Replace semantics are scoped to the layout this tool owns (data.yaml,
+    # images/, labels/) — never to sibling subtrees under the prefix, so a
+    # ref-native seed at dataset/ does not wipe a nested dataset/<version>/.
+    owned = tuple(prefix + d for d in ("images/", "labels/")) + (prefix + "data.yaml",)
+    stale = [p for p in client.list(prefix) if p not in wanted and p.startswith(owned)]
     for path, data in wanted.items():
         client.put(path, data)
     for path in stale:

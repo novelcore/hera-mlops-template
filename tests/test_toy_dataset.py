@@ -77,8 +77,9 @@ class _FakeLakeFS:
         self.calls.append((req.get_method(), req.full_url))
         body = b"{}"
         if "/objects/ls" in req.full_url:
-            body = json.dumps({"results": [{"path": "dataset/main/old.txt"},
-                                           {"path": "dataset/main/data.yaml"}],
+            body = json.dumps({"results": [{"path": "dataset/main/labels/old.txt"},
+                                           {"path": "dataset/main/data.yaml"},
+                                           {"path": "dataset/main/v2/data.yaml"}],
                                "pagination": {"has_more": False, "next_offset": ""}}).encode()
         elif req.full_url.endswith("/commits"):
             body = json.dumps({"id": "abc123def456"}).encode()
@@ -95,5 +96,6 @@ def test_sync_uploads_deletes_stale_and_commits(monkeypatch):
     assert (n, deleted, commit) == (2, 1, "abc123def456")
     methods = [m for m, _ in fake.calls]
     assert methods == ["GET", "POST", "POST", "DELETE", "POST"]
-    assert "path=dataset%2Fmain%2Fold.txt" in fake.calls[3][1]
+    assert "path=dataset%2Fmain%2Flabels%2Fold.txt" in fake.calls[3][1]
+    assert not any("v2" in url for _, url in fake.calls)  # sibling subtree untouched
     assert fake.calls[1][1].endswith("branches/main/objects?path=dataset%2Fmain%2Fdata.yaml")
