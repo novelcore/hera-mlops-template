@@ -122,11 +122,12 @@ class ConfigValidationService:
         ref = str(data.get("ref") or "main")
 
         if source == "lakefs":
-            # REF-NATIVE (same as dataset-loading._resolve_source): the dataset
-            # lives at `dataset/` under the ref's root, never in a per-version
-            # subfolder. `version` is only the provenance tag recorded in MLflow.
+            # PLATFORM STANDARD (same as dataset-loading._resolve_source):
+            # {ref}/dataset/{version}/, version defaulting to the ref, so the
+            # default run reads {ref}/dataset/{ref}/.
             repo = str((platform.get("lakefs") or {}).get("repository") or "")
-            return f"s3://{repo}/{ref}/dataset/"
+            version = str(data.get("version") or "") or ref
+            return f"s3://{repo}/{ref}/dataset/{version}/"
         version = str(data.get("version") or "") or ref
         return f"s3://{_DEFAULT_BUCKET}/upload-initial/dataset/{version}/"
 
