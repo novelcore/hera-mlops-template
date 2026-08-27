@@ -44,7 +44,7 @@ import re
 # `python3 -c`. Plain string — no Argo tags inside (all run-time inputs
 # arrive via env), so it survives every templating layer verbatim.
 MELUXINA_SUBMIT_CODE = r'''
-STAGEOUT = """
+STAGEOUT = r"""
 # F-05 stage-out: the step's declared outputs (/work/output/<name>.json,
 # what Argo would have read as outputs.parameters in-cluster) go to lakeFS
 # at hpc-outputs/{wf-uid}/{step}/ on the run's branch; the waiter fetches

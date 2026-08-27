@@ -425,6 +425,13 @@ def test_stage_out_batch_and_waiter_invariants():
     assert 'rm -rf "$KAOS_WORK"' in code and "[ $rc -eq 0 ] && rm -rf" in code  # scratch kept on failure
     assert "STAGEOUT_B64" in code and "STEP_OUTPUTS" in code
     assert "fetch_outputs()" in code and "/tmp/outputs/" in code
-    stageout = re.search(r'STAGEOUT = """\n(.*?)"""', code, re.S).group(1)
-    ast.parse(stageout)
+    # Execute the payload DEFINITIONS exactly as python3 -c will on the node
+    # (the submit code is raw; nested payloads must survive escape processing),
+    # then parse what the batch script will actually run.
+    ns = {}
+    exec(code.split("\nWALLET = None", 1)[0], ns)
+    for payload in ("STAGEIN", "STAGEOUT"):
+        ast.parse(ns[payload])
+    stageout = ns["STAGEOUT"]
+    assert "\r\n" not in stageout.replace("\\r\\n", "")  # escapes intact, no raw CR/LF in literals
     assert "hpc-outputs/" in stageout and "branches/%s/objects" in stageout
