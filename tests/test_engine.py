@@ -38,6 +38,15 @@ def _render():
 def _enhanced():
     return enhance.enhance(_render(), CONTEXT, CATALOG)
 
+def _step_templates(wft):
+    """Developer step templates only — the platform's MeluXina runner
+    (`meluxina-run`, labelled compute-type=hpc, PRD-1016) is a container
+    template too but has no class param, no Dockerfile and no step env."""
+    return [t for t in wft["spec"]["templates"] if "container" in t and
+            (t.get("metadata", {}).get("labels", {})
+             .get("platform.kubecore.io/compute-type") != "hpc")]
+
+
 
 # ------------------------------------------------------------- derivation
 
@@ -208,9 +217,7 @@ def test_per_step_class_params():
 
 def test_nodeselector_uses_step_class():
     wft = _enhanced()
-    for t in wft["spec"]["templates"]:
-        if "container" not in t:
-            continue
+    for t in _step_templates(wft):
         sel = t.get("nodeSelector", {}).get("platform.kubecore.io/nodegroup-type", "")
         assert sel == f"{{{{workflow.parameters.{t['name']}-class}}}}", \
             f"{t['name']} nodeSelector should reference its {{step}}-class param"
@@ -225,9 +232,7 @@ def test_gpu_routing():
     """
     wft = _enhanced()
     gpu_steps, typed_gpu = set(), set()
-    for t in wft["spec"]["templates"]:
-        if "container" not in t:
-            continue
+    for t in _step_templates(wft):
         req = t["container"].get("resources", {}).get("requests", {})
         if "nvidia.com/gpu" in req:
             typed_gpu.add(t["name"])
@@ -282,9 +287,7 @@ def test_steps_tolerate_every_catalog_class():
         merged = {**tier, **c}
         if merged.get("tolerationKey"):
             want.add((merged["tolerationKey"], merged["tolerationValue"]))
-    for t in wft["spec"]["templates"]:
-        if "container" not in t:
-            continue
+    for t in _step_templates(wft):
         have = {(x.get("key"), x.get("value")) for x in t.get("tolerations", [])}
         missing = want - have
         assert not missing, f"{t['name']}: missing class tolerations {missing}"
@@ -306,10 +309,9 @@ def test_sizing_knobs_and_checkpoint_env():
     names = {p["name"] for p in wft["spec"]["arguments"]["parameters"]}
     assert "model-training-cpu" in names and "model-training-mem" in names
     # checkpoint env on every step
-    for t in wft["spec"]["templates"]:
-        if "container" in t:
-            env = {e["name"] for e in t["container"].get("env", [])}
-            assert "CHECKPOINT_BUCKET" in env and "MLFLOW_TRACKING_URI" in env
+    for t in _step_templates(wft):
+        env = {e["name"] for e in t["container"].get("env", [])}
+        assert "CHECKPOINT_BUCKET" in env and "MLFLOW_TRACKING_URI" in env
 
 
 def test_unknown_annotation_fails():
@@ -391,7 +393,7 @@ def test_every_declared_step_has_a_buildable_dockerfile():
     steps/<dir>/Dockerfile (or the image escape-hatch), so a forgotten
     Dockerfile is caught at render time — not as a run-time ImagePullBackOff."""
     wft = _enhanced()
-    steps = [t for t in wft["spec"]["templates"] if "container" in t]
+    steps = _step_templates(wft)
     missing = []
     for t in steps:
         annotations = t.get("metadata", {}).get("annotations", {})
@@ -450,9 +452,7 @@ def test_mlflow_zitadel_auth_injected_into_steps():
     coordinates; a context without them (OIDC off) leaves the env untouched."""
     import copy
     wft = _enhanced()
-    for t in wft["spec"]["templates"]:
-        if "container" not in t:
-            continue
+    for t in _step_templates(wft):
         env = {e["name"]: e.get("value") for e in t["container"].get("env", [])}
         assert env.get("MLFLOW_TRACKING_AUTH") == "zitadel", t["name"]
         assert env.get("ZITADEL_DOMAIN") == CONTEXT["mlflow"]["oidcDomain"], t["name"]
@@ -469,7 +469,7 @@ def test_mlflow_zitadel_auth_injected_into_steps():
     ctx["mlflow"]["oidcDomain"] = ""
     ctx["mlflow"]["oidcProjectId"] = ""
     wft2 = enhance.enhance(_render(), ctx, CATALOG)
-    for t in wft2["spec"]["templates"]:
+    for t in _step_templates(wft2):
         if "container" not in t:
             continue
         env = {e["name"] for e in t["container"].get("env", [])}
@@ -488,8 +488,8 @@ def test_disk_sizing_knobs_and_requests():
     # platform floor on a knob-less step; developer disk="20Gi" flows through
     assert params["model-quantization-disk"]["value"] == enhance.DISK_REQUEST_DEFAULT
     assert params["qat-finetune-disk"]["value"] == "20Gi"
-    for t in wft["spec"]["templates"]:
-        if "container" not in t or t["name"] == "compose-and-validate":
+    for t in _step_templates(wft):
+        if t["name"] == "compose-and-validate":
             continue
         name = t["name"]
         assert f"{name}-disk" in params, f"{name}: missing -disk knob"
