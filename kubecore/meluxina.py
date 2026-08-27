@@ -44,6 +44,31 @@ import re
 # `python3 -c`. Plain string — no Argo tags inside (all run-time inputs
 # arrive via env), so it survives every templating layer verbatim.
 MELUXINA_SUBMIT_CODE = r'''
+STAGEOUT = """
+# F-05 stage-out: the step's declared outputs (/work/output/<name>.json,
+# what Argo would have read as outputs.parameters in-cluster) go to lakeFS
+# at hpc-outputs/{wf-uid}/{step}/ on the run's branch; the waiter fetches
+# them back into the twin's outputs so downstream steps see real values.
+import json, os, pathlib, urllib.parse, urllib.request
+base = os.environ['LAKEFS_ENDPOINT'].rstrip('/') + '/api/v1'
+H = {'Authorization': 'Bearer ' + os.environ['LAKEFS_BEARER_TOKEN']}
+repo = os.environ['DATASET_REPO']; branch = os.environ.get('DATASET_REF') or 'main'
+prefix = 'hpc-outputs/%s/%s/' % (os.environ['WF_UID'], os.environ['STEP_NAME'])
+out = pathlib.Path(os.environ['KAOS_WORK']) / 'output'
+for name in [n for n in os.environ.get('STEP_OUTPUTS', '').split(',') if n]:
+    f = out / (name + '.json')
+    if not f.exists():
+        print('stage-out: no', f, flush=True); continue
+    data = f.read_bytes()
+    body = (b'--B\r\nContent-Disposition: form-data; name="content"; filename="f"\r\n'
+            b'Content-Type: application/octet-stream\r\n\r\n' + data + b'\r\n--B--\r\n')
+    q = urllib.parse.urlencode({'path': prefix + name + '.json'})
+    req = urllib.request.Request(base + '/repositories/%s/branches/%s/objects?%s' % (repo, branch, q),
+                                 data=body, method='POST',
+                                 headers=dict(H, **{'Content-Type': 'multipart/form-data; boundary=B'}))
+    urllib.request.urlopen(req, timeout=120).read()
+    print('stage-out:', name, len(data), 'bytes ->', prefix, flush=True)
+"""
 import base64, json, os, shlex, signal, sys, time, urllib.parse, urllib.request
 
 # F-04 stage-in, run ON the compute node (system python3, stdlib only):
@@ -115,6 +140,9 @@ print('stage-in: downloaded', n, 'of', len(objs), '->', dest, flush=True)
 # failure degrades loudly to no-wallet (job still runs, data-plane env
 # omitted) — never the machine key itself into the Slurm environment
 # (T-03: HPC-side env must only ever see short-lived tokens).
+WALLET = None
+
+
 def mint_wallet():
     keyfile = os.environ.get('ZITADEL_MACHINE_KEY_FILE') or ''
     domain = os.environ.get('ZITADEL_DOMAIN') or ''
@@ -283,6 +311,11 @@ def submit():
         'if [ -n "$DATASET_DIR" ]; then'
         ' BIND="-B $DATASET_DIR:/kubecore/dataset:ro";'
         ' export APPTAINERENV_KUBECORE_DATASET_DIR=/kubecore/dataset; fi',
+        # Writable /work: the SIF is read-only, but steps write /work/output
+        # (declared outputs), /work/runs, /work/dataset caches. Per-job scratch
+        # on Lustre, removed after a successful stage-out.
+        'export KAOS_WORK=$SCR/kaos-work/$SLURM_JOB_ID; mkdir -p $KAOS_WORK/output',
+        'BIND="$BIND -B $KAOS_WORK:/work"',
         'if [ ! -f "$SIF" ]; then',
         # GCP token ONLY for GAR hosts: presenting it to Zot turns an
         # anonymous-OK pull into 401 authentication required (live job
@@ -298,13 +331,21 @@ def submit():
         'if [ -n "$STEP_CMD" ]; then apptainer exec --nv $PWD_OPT $BIND "$SIF"'
         ' /bin/sh -c "$STEP_CMD"; else apptainer exec --nv $PWD_OPT $BIND "$SIF"'
         ' nvidia-smi -L; fi',
-        'rc=$?; [ $rc -ne 0 ] && fail $rc',
+        'rc=$?',
+        'if [ -n "$STEP_OUTPUTS" ] && [ -n "$STAGEOUT_B64" ] && [ -n "$LAKEFS_BEARER_TOKEN" ]; then'
+        ' printf %s "$STAGEOUT_B64" | base64 -d | python3 - || echo "stage-out failed (rc=$rc)"; fi',
+        '[ $rc -eq 0 ] && rm -rf "$KAOS_WORK"',
+        '[ $rc -ne 0 ] && fail $rc',
         'exit 0',
     ])
     env = ['PATH=/usr/bin:/bin:/usr/local/bin', 'HOME=/home/users/u104378',
            'USER=u104378', 'IMAGE_REF=' + img, 'REG_TOKEN=' + reg,
-           'STEP_CMD=' + cmd, 'STEP_WORKDIR=' + fetch_workdir(img, reg)]
-    wallet = mint_wallet()
+           'STEP_CMD=' + cmd, 'STEP_WORKDIR=' + fetch_workdir(img, reg),
+           'WF_UID=' + (os.environ.get('WF_UID') or ''),
+           'STEP_NAME=' + (os.environ.get('STEP_NAME') or ''),
+           'STEP_OUTPUTS=' + (os.environ.get('STEP_OUTPUTS') or '')]
+    global WALLET
+    wallet = WALLET = mint_wallet()
     if wallet:
         # Public endpoints only, short-lived bearer only (T-03). MLflow's
         # client honors MLFLOW_TRACKING_TOKEN natively; the stage-in and any
@@ -320,7 +361,9 @@ def submit():
                     'DATASET_REPO=' + (os.environ.get('DATASET_REPO') or ''),
                     'DATASET_REF=' + (os.environ.get('DATASET_REF') or ''),
                     'STAGEIN_B64='
-                    + base64.b64encode(STAGEIN.encode()).decode()]
+                    + base64.b64encode(STAGEIN.encode()).decode(),
+                    'STAGEOUT_B64='
+                    + base64.b64encode(STAGEOUT.encode()).decode()]
     body = {'job': {'name': jobname, 'partition': 'gpu',
                     'account': 'p201342', 'qos': 'default',
                     'time_limit': int(os.environ.get('SLURM_TIME_LIMIT') or 240),
@@ -371,6 +414,32 @@ else:
     jid = submit()
 
 open('/tmp/slurm-job-id', 'w').write(str(jid))
+OUTPUT_NAMES = [n for n in os.environ.get('STEP_OUTPUTS', '').split(',') if n]
+os.makedirs('/tmp/outputs', exist_ok=True)
+for n in OUTPUT_NAMES:
+    open('/tmp/outputs/%s.json' % n, 'w').write('{}')
+
+
+def fetch_outputs():
+    """F-05: pull the step's staged-out outputs back into the twin."""
+    base = (os.environ.get('LAKEFS_EXTERNAL_URL') or '').rstrip('/')
+    repo = os.environ.get('DATASET_REPO') or ''
+    if not (OUTPUT_NAMES and base and repo and WALLET):
+        return
+    branch = os.environ.get('DATASET_REF') or 'main'
+    for n in OUTPUT_NAMES:
+        q = urllib.parse.urlencode({'path': 'hpc-outputs/%s/%s/%s.json' % (
+            os.environ.get('WF_UID', ''), os.environ.get('STEP_NAME', ''), n)})
+        try:
+            data = urllib.request.urlopen(urllib.request.Request(
+                base + '/api/v1/repositories/%s/refs/%s/objects?%s' % (repo, branch, q),
+                headers={'Authorization': 'Bearer ' + WALLET}), timeout=60).read()
+            open('/tmp/outputs/%s.json' % n, 'wb').write(data)
+            print('output', n, ':', len(data), 'bytes', flush=True)
+        except Exception as e:
+            print('output', n, 'not staged out (default {}):', e, flush=True)
+
+
 TERMINAL = ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'NODE_FAIL',
             'PREEMPTED', 'OUT_OF_MEMORY')
 resubmitted = False
@@ -397,6 +466,8 @@ while True:
                 jid = submit()
                 open('/tmp/slurm-job-id', 'w').write(str(jid))
                 continue
+            if 'COMPLETED' in st:
+                fetch_outputs()
             sys.exit(0 if ('COMPLETED' in st and rc in (0, None)) else 1)
     except SystemExit:
         raise
@@ -505,6 +576,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
     by_tpl = {s["name"]: s for s in steps}
 
     routed = []
+    outputs_union: set = set()
     for task in list(tasks):
         step = by_tpl.get(task.get("template"))
         if step is None or step["name"] not in gpu_step_names or task.get("when"):
@@ -531,6 +603,9 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
         cmd = [t for t in cmd
                if t and "{{inputs." not in t and "{{item" not in t]
         minutes = step_time_limit(step)
+        step_outputs = [o["name"] for o in
+                        ((step.get("outputs") or {}).get("parameters") or [])]
+        outputs_union.update(step_outputs)
         twin = {
             "name": task["name"] + "-" + provider,
             "template": "meluxina-run",
@@ -542,6 +617,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
                 {"name": "time-limit", "value": str(minutes)},
                 {"name": "deadline-seconds",
                  "value": str((minutes + QUEUE_ALLOWANCE_MINUTES) * 60)},
+                {"name": "step-outputs", "value": ",".join(step_outputs)},
             ]},
         }
         if task.get("depends"):
@@ -551,6 +627,24 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
 
     if not routed:
         return
+
+    # F-05: downstream steps consume {{tasks.<routed>.outputs.parameters.P}}.
+    # Exactly one twin ran; the other is Skipped and its outputs resolve to
+    # their declared defaults ("{}"). Pick the twin that actually ran.
+    def _pick(m):
+        r, p = m.group(1), m.group(2)
+        return ("{{=tasks['%s'].status == 'Skipped' ? tasks['%s-%s'].outputs."
+                "parameters['%s'] : tasks['%s'].outputs.parameters['%s']}}"
+                % (r, r, provider, p, r, p))
+    ref_re = re.compile(r"\{\{\s*tasks\.(%s)\.outputs\.parameters\.([A-Za-z0-9_.-]+)\s*\}\}"
+                        % "|".join(re.escape(r) for r in routed))
+    for task in tasks:
+        if task["name"].endswith("-" + provider):
+            continue
+        for p in ((task.get("arguments") or {}).get("parameters") or []):
+            v = p.get("value")
+            if isinstance(v, str) and ref_re.fullmatch(v.strip()):
+                p["value"] = ref_re.sub(_pick, v.strip())
 
     # A bare task token in Argo depends grammar means Succeeded; a routed dep
     # is now a twin pair where exactly one twin runs and the other is Skipped.
@@ -585,7 +679,8 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
         "name": "meluxina-run",
         "inputs": {"parameters": [
             {"name": "step-name"}, {"name": "image"}, {"name": "step-command"},
-            {"name": "time-limit"}, {"name": "deadline-seconds"}]},
+            {"name": "time-limit"}, {"name": "deadline-seconds"},
+            {"name": "step-outputs", "value": ""}]},
         # Per-step: Slurm time limit + queue/prep allowance (see
         # QUEUE_ALLOWANCE_MINUTES). Argo resolves the parameter here.
         "activeDeadlineSeconds": "{{inputs.parameters.deadline-seconds}}",
@@ -607,6 +702,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
                 {"name": "IMAGE_REF", "value": "{{inputs.parameters.image}}"},
                 {"name": "STEP_COMMAND", "value": "{{inputs.parameters.step-command}}"},
                 {"name": "SLURM_TIME_LIMIT", "value": "{{inputs.parameters.time-limit}}"},
+                {"name": "STEP_OUTPUTS", "value": "{{inputs.parameters.step-outputs}}"},
                 {"name": "ZITADEL_MACHINE_KEY_FILE",
                  "value": "/etc/mlflow-svc/ZITADEL_MACHINE_KEY"},
                 {"name": "ZITADEL_DOMAIN",
@@ -621,6 +717,11 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
                 {"name": "DATASET_REF", "value": dataset_ref},
             ],
         },
+        # slurm-job-id plus the union of every routed step's declared outputs
+        # (one shared template; each twin fills its own, the rest default).
         "outputs": {"parameters": [{"name": "slurm-job-id",
-                                    "valueFrom": {"path": "/tmp/slurm-job-id"}}]},
+                                    "valueFrom": {"path": "/tmp/slurm-job-id"}}]
+                    + [{"name": n, "valueFrom": {"path": "/tmp/outputs/%s.json" % n,
+                                                 "default": "{}"}}
+                       for n in sorted(outputs_union)]},
     })
