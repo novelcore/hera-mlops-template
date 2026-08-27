@@ -570,9 +570,14 @@ def test_ml_environment_selector_is_project_scoped():
     ctx = copy.deepcopy(CONTEXT)
     ctx["mlEnvironment"] = {"name": "training", "namespace": f"{ctx['project']}-training"}
     wft = enhance.enhance(_render(), ctx, CATALOG)
+    checked = 0
     for t in wft["spec"]["templates"]:
-        if "container" not in t:
+        # only in-cluster step templates carry a nodeSelector (the MeluXina
+        # submit leg runs off-cluster and has none)
+        if "container" not in t or not t.get("nodeSelector"):
             continue
-        sel = t.get("nodeSelector", {})
+        sel = t["nodeSelector"]
         assert sel.get("platform.kubecore.io/environment") == "training", t["name"]
         assert sel.get("platform.kubecore.io/project") == ctx["project"], (t["name"], sel)
+        checked += 1
+    assert checked > 0
