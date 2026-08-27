@@ -398,8 +398,9 @@ def test_stage_out_declares_step_outputs_on_the_runner_and_twin():
     twin = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-training-meluxina")
     args = {p["name"]: p["value"] for p in twin["arguments"]["parameters"]}
     assert args["step-outputs"] == "training-result"
-    qat_twin = next(t for t in dag["dag"]["tasks"] if t["name"] == "qat-finetune-meluxina")
-    assert {p["name"]: p["value"] for p in qat_twin["arguments"]["parameters"]}["step-outputs"] == ""
+    # qat-finetune carries its own `when` in the fixture, so it is not routed
+    # (existing contract) — no twin, nothing to assert about its outputs.
+    assert not any(t["name"] == "qat-finetune-meluxina" for t in dag["dag"]["tasks"])
     env = {e["name"]: e.get("value") for e in run["container"]["env"]}
     assert env["STEP_OUTPUTS"] == "{{inputs.parameters.step-outputs}}"
 
