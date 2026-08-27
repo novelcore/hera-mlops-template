@@ -182,6 +182,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--upload", action="store_true", help="sync to lakeFS after generating")
     ap.add_argument("--repo", help="lakeFS repository (usually the project name)")
     ap.add_argument("--branch", default="main", help="lakeFS branch = the data.ref you train on")
+    ap.add_argument("--prefix", default=None,
+                    help="object prefix under the branch (default dataset/{branch}/ — the "
+                         "hera-mlops-template layout; the official yolo-pipelines template is "
+                         "ref-native: pass --prefix dataset/)")
     ap.add_argument("--endpoint", default=os.environ.get("LAKEFS_ENDPOINT"),
                     help="lakeFS API endpoint (default: $LAKEFS_ENDPOINT)")
     args = ap.parse_args(argv)
@@ -194,7 +198,9 @@ def main(argv: list[str] | None = None) -> int:
     if not (args.repo and args.endpoint):
         print("--upload needs --repo and --endpoint/$LAKEFS_ENDPOINT", file=sys.stderr)
         return 2
-    prefix = f"dataset/{args.branch}/"
+    prefix = args.prefix if args.prefix is not None else f"dataset/{args.branch}/"
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
     n, deleted, commit = sync(LakeFS(args.endpoint, args.repo, args.branch), files, prefix)
     print(f"synced {n} objects to lakefs://{args.repo}/{args.branch}/{prefix} "
           f"(deleted {deleted} stale) commit {commit[:12]}")
