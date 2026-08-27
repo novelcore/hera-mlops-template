@@ -435,3 +435,22 @@ def test_stage_out_batch_and_waiter_invariants():
     stageout = ns["STAGEOUT"]
     assert "\r\n" not in stageout.replace("\\r\\n", "")  # escapes intact, no raw CR/LF in literals
     assert "hpc-outputs/" in stageout and "branches/%s/objects" in stageout
+
+
+def test_slurm_token_is_read_fresh_per_request():
+    """The MeluXina JWT rotates every 25 min (60 min lifetime); a queue wait
+    longer than that must not blind the waiter (live run tvsm8)."""
+    import re
+    from kubecore.meluxina import MELUXINA_SUBMIT_CODE as code
+    out = enhance(_raw(), _ctx())
+    run = next(t for t in out["spec"]["templates"] if t["name"] == "meluxina-run")
+    vols = {v["name"]: v for v in run["volumes"]}
+    assert vols["meluxina-jwt"]["secret"]["secretName"] == "meluxina-jwt"
+    mounts = {m["name"]: m["mountPath"] for m in run["container"]["volumeMounts"]}
+    assert mounts["meluxina-jwt"] == "/etc/meluxina-jwt"
+    assert "def tok():" in code and "/etc/meluxina-jwt/token" in code
+    # every Slurm request builds its headers at call time — no frozen header
+    # dict (the stage-in/out payloads keep their own lakeFS bearer `H`)
+    slurm = code.split("TOKEN_FILE = ", 1)[1]
+    assert not re.search(r"headers=H\b", slurm)
+    assert slurm.count("headers=hdrs()") >= 3  # get, submit, cancel

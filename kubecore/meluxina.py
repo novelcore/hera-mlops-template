@@ -225,13 +225,34 @@ def fetch_workdir(image, reg_token):
 
 API = 'https://slurm-api.lxp.lu/slurm/v0.0.44'
 SDB = 'https://slurm-api.lxp.lu/slurmdb/v0.0.44'
-TOK = os.environ['SLURM_TOKEN'].strip()
-H = {'X-SLURM-USER-NAME': 'u104378', 'X-SLURM-USER-TOKEN': TOK,
-     'Content-Type': 'application/json'}
+TOKEN_FILE = '/etc/meluxina-jwt/token'
+
+
+def tok():
+    """The MeluXina JWT, read FRESH on every request. The platform mints it
+    with a 60-minute lifetime and rotates the Secret every 25 minutes; the
+    mounted file follows the rotation, an env var does not (live run
+    yolotrain-meluxina-toy-tvsm8: the pod's env token expired 13:30:02 while
+    the job still queued — every poll 502/511 for hours, and cancel/resubmit
+    would have failed the same way)."""
+    try:
+        with open(TOKEN_FILE) as f:
+            t = f.read().strip()
+            if t:
+                return t
+    except OSError:
+        pass
+    return os.environ['SLURM_TOKEN'].strip()
+
+
+def hdrs():
+    return {'X-SLURM-USER-NAME': 'u104378', 'X-SLURM-USER-TOKEN': tok(),
+            'Content-Type': 'application/json'}
+
 
 def get(url):
     return json.load(urllib.request.urlopen(
-        urllib.request.Request(url, headers=H), timeout=30))
+        urllib.request.Request(url, headers=hdrs()), timeout=30))
 
 jobname = 'kaos-' + os.environ['WF_UID'] + '-' + os.environ['STEP_NAME']
 img = os.environ['IMAGE_REF']
@@ -372,7 +393,7 @@ def submit():
             'script': batch}
     req = urllib.request.Request(API + '/job/submit',
                                  data=json.dumps(body).encode(),
-                                 headers=H, method='POST')
+                                 headers=hdrs(), method='POST')
     resp = json.load(urllib.request.urlopen(req, timeout=30))
     j = resp.get('job_id')
     print('submitted job', j, 'errors:', resp.get('errors'), flush=True)
@@ -384,7 +405,7 @@ def submit():
 def cancel(j):
     try:
         urllib.request.urlopen(urllib.request.Request(
-            API + '/job/' + str(j), headers=H, method='DELETE'), timeout=30)
+            API + '/job/' + str(j), headers=hdrs(), method='DELETE'), timeout=30)
         print('cancelled job', j, flush=True)
     except Exception as e:
         print('cancel failed:', e, flush=True)
@@ -687,12 +708,19 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
         "metadata": {"labels": {"platform.kubecore.io/compute-type": "hpc"}},
         "volumes": [{"name": "mlflow-svc", "secret": {
             "secretName": str(mlflow_ctx.get("svcSecret") or "mlflow-svc"),
-            "optional": True}}],
+            "optional": True}},
+                    # The rotated MeluXina JWT as a file: kubelet refreshes the
+                    # mount on rotation, so long queue waits keep a valid token.
+                    {"name": "meluxina-jwt", "secret": {"secretName": "meluxina-jwt",
+                                                        "optional": True}}],
         "container": {
             "image": "python:3.12-alpine",
             "command": ["python3", "-c", MELUXINA_SUBMIT_CODE],
             "volumeMounts": [{"name": "mlflow-svc",
                               "mountPath": "/etc/mlflow-svc",
+                              "readOnly": True},
+                             {"name": "meluxina-jwt",
+                              "mountPath": "/etc/meluxina-jwt",
                               "readOnly": True}],
             "env": [
                 {"name": "SLURM_TOKEN", "valueFrom": {"secretKeyRef": {
