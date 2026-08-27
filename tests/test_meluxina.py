@@ -222,10 +222,10 @@ def test_submit_code_stagein_and_wallet_invariants():
     assert "data-cache" in src and "|| fail 232" in src
     # failures self-diagnose into the job comment (live 5143859 was a black
     # box); the waiter cancels a still-PENDING job on SIGTERM and resubmits
-    # once with fresh credentials on a pull failure
+    # (bounded) with fresh credentials on a pull failure
     assert "fail(){ scontrol update" in src
     assert "signal.signal(signal.SIGTERM" in src
-    assert "rc == 231 and not resubmitted" in src
+    assert "resubmits < PULL_RESUBMITS" in src and "PULL_RESUBMITS = 3" in src
     assert "/kubecore/dataset:ro" in src
     assert "APPTAINERENV_KUBECORE_DATASET_DIR" in src
     # the step runs from the image WORKDIR (Apptainer ignores it otherwise)
