@@ -581,3 +581,31 @@ def test_ml_environment_selector_is_project_scoped():
         assert sel.get("platform.kubecore.io/project") == ctx["project"], (t["name"], sel)
         checked += 1
     assert checked > 0
+
+
+def test_dedicated_ml_environment_uses_operator_selector_and_app_taint():
+    """PRD-1124 D-07: for an app-dedicated ml environment the operator's
+    mlEnvironment block carries the app key and the app-exclusivity toleration;
+    the enhancer must copy both verbatim and NOT add the kubenv taint."""
+    import copy
+
+    ctx = copy.deepcopy(CONTEXT)
+    ctx["mlEnvironment"] = {
+        "name": "training", "namespace": f"{ctx['project']}-yolo--training",
+        "nodeSelector": {"platform.kubecore.io/project": ctx["project"],
+                         "platform.kubecore.io/environment": "training",
+                         "platform.kubecore.io/app": "yolo"},
+        "tolerations": [{"key": "platform.kubecore.io/app", "operator": "Equal",
+                         "value": "yolo", "effect": "NoSchedule"}],
+    }
+    wft = enhance.enhance(_render(), ctx, CATALOG)
+    checked = 0
+    for t in wft["spec"]["templates"]:
+        if "container" not in t or not t.get("nodeSelector"):
+            continue
+        assert t["nodeSelector"].get("platform.kubecore.io/app") == "yolo", t["name"]
+        keys = {x.get("key"): x.get("value") for x in t.get("tolerations", [])}
+        assert keys.get("platform.kubecore.io/app") == "yolo", (t["name"], keys)
+        assert "platform.kubecore.io/kubenv" not in keys, (t["name"], keys)
+        checked += 1
+    assert checked > 0

@@ -505,16 +505,22 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
     ml_env = ctx.get("mlEnvironment") or {}
     ml_env_name = (ml_env.get("name") or "").strip()
     if ml_env_name:
-        # PROJECT-scoped (PRD-1124): environment names repeat across projects,
-        # so two "training" envs with a cpu-small flavour label their pools
-        # identically apart from platform.kubecore.io/project — without it a
-        # step lands on another tenant's pool (live 2026-08-27).
-        project = (ctx.get("project") or "").strip()
-        if project:
-            step["nodeSelector"].setdefault("platform.kubecore.io/project", project)
-        step["nodeSelector"].setdefault(
-            "platform.kubecore.io/environment", ml_env_name
-        )
+        # The operator's selector is the authority (PRD-1124): project +
+        # environment, plus app for an APP-dedicated ml environment (D-07,
+        # spec.dedicatedEnvironment.ml → app-tainted pools). Copy it verbatim
+        # so the keys never drift from what kubenv-gcp stamps on the pools;
+        # fall back to the legacy project/environment pair for a context
+        # that predates the map (pipeline-context rendered by an older
+        # operator). Project scoping is load-bearing either way: environment
+        # names repeat across projects (live cross-tenant leak, 2026-08-27).
+        selector = ml_env.get("nodeSelector") or {}
+        if not selector:
+            selector = {"platform.kubecore.io/environment": ml_env_name}
+            project = (ctx.get("project") or "").strip()
+            if project:
+                selector["platform.kubecore.io/project"] = project
+        for key, value in selector.items():
+            step["nodeSelector"].setdefault(key, value)
 
     # Bound how long this step may sit unschedulable (see the constants above).
     # fill-absent: a developer who set their own deadline keeps it.
@@ -542,19 +548,21 @@ def enhance_scheduling(step: dict, ctx: dict, annots: dict) -> None:
         # GKE auto-taints accelerator nodes; tolerate it so the pod schedules.
         # Harmless on CPU nodes (tolerations never attract, only permit).
         tolerations.append({"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"})
-    if ml_env_name and not any(
-        t.get("key") == "platform.kubecore.io/kubenv" for t in tolerations
-    ):
-        # PRD-858: the env pools carry the kubenv env-exclusivity taint;
-        # without this toleration every step Pends forever on its own pools.
-        tolerations.append(
-            {
-                "key": "platform.kubecore.io/kubenv",
-                "operator": "Equal",
-                "value": ml_env_name,
-                "effect": "NoSchedule",
-            }
-        )
+    if ml_env_name:
+        # The pools carry the env-exclusivity taint (kubenv={env}) — or the
+        # app-exclusivity taint (app={app}) for a dedicated ml environment
+        # (D-07); the operator's mlEnvironment.tolerations says which. Without
+        # it every step Pends forever on its own pools (PRD-858).
+        env_tolerations = ml_env.get("tolerations") or [
+            {"key": "platform.kubecore.io/kubenv", "operator": "Equal",
+             "value": ml_env_name, "effect": "NoSchedule"}
+        ]
+        for tol in env_tolerations:
+            if not any(t.get("key") == tol.get("key") and t.get("value") == tol.get("value") for t in tolerations):
+                tolerations.append({
+                    "key": tol.get("key"), "operator": tol.get("operator", "Equal"),
+                    "value": tol.get("value"), "effect": tol.get("effect", "NoSchedule"),
+                })
 
     # Sizing. Developer-set requests always win; a missing limit mirrors the
     # (possibly developer-set) request. Only fields the developer left entirely
