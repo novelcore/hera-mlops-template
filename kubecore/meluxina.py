@@ -322,7 +322,8 @@ def submit():
                     'STAGEIN_B64='
                     + base64.b64encode(STAGEIN.encode()).decode()]
     body = {'job': {'name': jobname, 'partition': 'gpu',
-                    'account': 'p201342', 'qos': 'default', 'time_limit': 240,
+                    'account': 'p201342', 'qos': 'default',
+                    'time_limit': int(os.environ.get('SLURM_TIME_LIMIT') or 240),
                     'current_working_directory': '/home/users/u104378',
                     'environment': env, 'tasks': 1, 'nodes': '1'},
             'script': batch}
@@ -451,6 +452,34 @@ def _cmd_json(cmd: list) -> str:
     return "[" + ", ".join(parts) + "]"
 
 
+DEFAULT_TIME_LIMIT_MINUTES = 240
+# Argo budget on top of the Slurm limit: the twin pod also waits in the
+# MeluXina queue (evening waits run to hours), builds the SIF and stages the
+# dataset in before the job's own clock starts. If the twin's deadline fires
+# first, on_term leaves a RUNNING job to finish unobserved — so the deadline
+# must comfortably exceed queue + prep + time limit.
+QUEUE_ALLOWANCE_MINUTES = 480
+HPC_ANNOTATION = "platform.kubecore.io/hpc"
+
+
+def parse_time_limit(value) -> int:
+    """'90' / '90m' -> 90 minutes, '12h' -> 720. Raises ValueError otherwise."""
+    text = str(value).strip()
+    m = re.match(r"^([0-9]+)([mh]?)$", text)
+    if not m or int(m.group(1)) == 0:
+        raise ValueError(
+            "%s=%r: expected minutes or hours like '90m', '12h' or '720'"
+            % (HPC_ANNOTATION, value))
+    minutes = int(m.group(1))
+    return minutes * 60 if m.group(2) == "h" else minutes
+
+
+def step_time_limit(step: dict) -> int:
+    """Slurm wall-clock minutes for a routed step (annotation or default)."""
+    raw = ((step.get("metadata") or {}).get("annotations") or {}).get(HPC_ANNOTATION)
+    return parse_time_limit(raw) if raw not in (None, "") else DEFAULT_TIME_LIMIT_MINUTES
+
+
 def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None:
     """Route GPU steps to MeluXina behind the `target` param (module doc)."""
     hpc = ctx.get("hpc") or {}
@@ -501,6 +530,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
                            + (container.get("args") or []))]
         cmd = [t for t in cmd
                if t and "{{inputs." not in t and "{{item" not in t]
+        minutes = step_time_limit(step)
         twin = {
             "name": task["name"] + "-" + provider,
             "template": "meluxina-run",
@@ -509,6 +539,9 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
                 {"name": "step-name", "value": task["name"]},
                 {"name": "image", "value": container.get("image", "")},
                 {"name": "step-command", "value": _cmd_json(cmd)},
+                {"name": "time-limit", "value": str(minutes)},
+                {"name": "deadline-seconds",
+                 "value": str((minutes + QUEUE_ALLOWANCE_MINUTES) * 60)},
             ]},
         }
         if task.get("depends"):
@@ -551,8 +584,11 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
     spec["templates"].append({
         "name": "meluxina-run",
         "inputs": {"parameters": [
-            {"name": "step-name"}, {"name": "image"}, {"name": "step-command"}]},
-        "activeDeadlineSeconds": 14400,
+            {"name": "step-name"}, {"name": "image"}, {"name": "step-command"},
+            {"name": "time-limit"}, {"name": "deadline-seconds"}]},
+        # Per-step: Slurm time limit + queue/prep allowance (see
+        # QUEUE_ALLOWANCE_MINUTES). Argo resolves the parameter here.
+        "activeDeadlineSeconds": "{{inputs.parameters.deadline-seconds}}",
         "metadata": {"labels": {"platform.kubecore.io/compute-type": "hpc"}},
         "volumes": [{"name": "mlflow-svc", "secret": {
             "secretName": str(mlflow_ctx.get("svcSecret") or "mlflow-svc"),
@@ -570,6 +606,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
                 {"name": "STEP_NAME", "value": "{{inputs.parameters.step-name}}"},
                 {"name": "IMAGE_REF", "value": "{{inputs.parameters.image}}"},
                 {"name": "STEP_COMMAND", "value": "{{inputs.parameters.step-command}}"},
+                {"name": "SLURM_TIME_LIMIT", "value": "{{inputs.parameters.time-limit}}"},
                 {"name": "ZITADEL_MACHINE_KEY_FILE",
                  "value": "/etc/mlflow-svc/ZITADEL_MACHINE_KEY"},
                 {"name": "ZITADEL_DOMAIN",

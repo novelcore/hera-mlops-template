@@ -58,10 +58,12 @@ _current = None
 # Kubernetes resource quantity ("10Gi", "512Mi", "2G"); anchored so a typo
 # ("10 Gi", "10GB") fails the render instead of rendering an invalid manifest.
 _DISK_QUANTITY_RE = re.compile(r"^[0-9]+(Ki|Mi|Gi|Ti|K|M|G|T)?$")
+_HPC_TIME_LIMIT_RE = re.compile(r"^[0-9]+[mh]?$")
 
 
 class Step:
-    def __init__(self, name, reads=None, gpu=False, needs=None, outputs=None, when=None, disk=None):
+    def __init__(self, name, reads=None, gpu=False, needs=None, outputs=None, when=None, disk=None,
+                 hpc_time_limit=None):
         self.name = name
         self.reads = list(reads or [])
         self.gpu = gpu
@@ -69,9 +71,11 @@ class Step:
         self.outputs = list(outputs or [])
         self.when = when
         self.disk = disk
+        self.hpc_time_limit = hpc_time_limit
 
 
-def step(name, reads=None, gpu=False, needs=None, outputs=None, when=None, disk=None) -> Step:
+def step(name, reads=None, gpu=False, needs=None, outputs=None, when=None, disk=None,
+         hpc_time_limit=None) -> Step:
     if _current is None:
         raise RuntimeError("step() must be called inside `with pipeline(...):`")
     if not isinstance(name, str) or not _STEP_NAME_RE.match(name):
@@ -91,7 +95,20 @@ def step(name, reads=None, gpu=False, needs=None, outputs=None, when=None, disk=
             f"step {name!r}: disk={disk!r} is not a Kubernetes quantity — use a "
             f"string like '20Gi' (digits + optional Ki/Mi/Gi/Ti/K/M/G/T suffix)."
         )
-    s = Step(name, reads, gpu, needs, outputs, when, disk)
+    if hpc_time_limit is not None and not (
+        isinstance(hpc_time_limit, str) and _HPC_TIME_LIMIT_RE.match(hpc_time_limit)
+    ):
+        raise AuthoringError(
+            f"step {name!r}: hpc_time_limit={hpc_time_limit!r} must be minutes or hours as a "
+            f"string like '90m', '12h' or '720' (the Slurm wall-clock limit when this GPU step "
+            f"runs on the HPC target; the run is killed when it elapses)."
+        )
+    if hpc_time_limit is not None and not gpu:
+        raise AuthoringError(
+            f"step {name!r}: hpc_time_limit only applies to gpu=True steps — only GPU steps "
+            f"are routed to the HPC target."
+        )
+    s = Step(name, reads, gpu, needs, outputs, when, disk, hpc_time_limit)
     _current.steps.append(s)
     return s
 
@@ -157,6 +174,12 @@ class pipeline:
                         ephemeral_request=s.disk,
                     )
                     if (s.gpu or s.disk)
+                    else None,
+                    # Read by kubecore/meluxina.py: the Slurm time limit when
+                    # this step runs on the HPC target (developer-set; the
+                    # enhancer defaults it otherwise).
+                    annotations={"platform.kubecore.io/hpc": s.hpc_time_limit}
+                    if s.hpc_time_limit
                     else None,
                     inputs=inputs,
                     outputs=[

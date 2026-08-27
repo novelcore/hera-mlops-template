@@ -277,6 +277,23 @@ exact section and step named (see §10) — nothing silently breaks.
 
 ---
 
+### 8.1 HPC target (MeluXina) time limit
+
+When the project's pool is HPC-enabled, every `gpu=True` step gets a `target`
+dropdown (`gcp` | `meluxina`). On `meluxina` the step runs as a Slurm job whose
+wall-clock limit defaults to 4 h — set it per step for real trainings:
+
+```python
+train = step("model-training", gpu=True, needs=[load], hpc_time_limit="12h",
+             reads=["experiment", "data", "model", "train"])
+```
+
+`hpc_time_limit` takes minutes or hours (`"90m"`, `"12h"`, `"720"`). Slurm
+kills the job when it elapses, so size it to your longest expected epoch
+budget. The platform adds a queue/prep allowance on top for the Argo side; a
+run that outlives that budget keeps running on MeluXina but is no longer
+observed by the pipeline (no registration step), so do not under-size it.
+
 ## 9. Data flow between steps
 
 **Parameters (small)**: declare `outputs=["training-result"]`, write
