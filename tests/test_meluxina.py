@@ -454,3 +454,22 @@ def test_slurm_token_is_read_fresh_per_request():
     slurm = code.split("TOKEN_FILE = ", 1)[1]
     assert not re.search(r"headers=H\b", slurm)
     assert slurm.count("headers=hdrs()") >= 3  # get, submit, cancel
+
+
+def test_wait_survives_pod_loss_and_wallet_expiry():
+    """Robust wait: a lost waiter pod is retried (and re-attaches via
+    find_active), and a job still queued when its 12 h MLflow/lakeFS wallet
+    is about to expire is resubmitted with a fresh one."""
+    out = enhance(_raw(), _ctx())
+    run = next(t for t in out["spec"]["templates"] if t["name"] == "meluxina-run")
+    assert run["retryStrategy"] == {"limit": "2", "retryPolicy": "OnError"}
+    from kubecore.meluxina import MELUXINA_SUBMIT_CODE as code
+    ns = {}
+    exec(code.split("\nWALLET = None", 1)[0], ns)
+    exec("WALLET = None" + code.split("\nWALLET = None", 1)[1].split("\ndef mint_wallet", 1)[0], ns)
+    import base64, json, time
+    seg = base64.urlsafe_b64encode(json.dumps({"exp": 1700000000}).encode()).decode().rstrip("=")
+    assert ns["wallet_exp"]("h." + seg + ".s") == 1700000000.0
+    assert ns["wallet_exp"]("garbage") == 0.0
+    assert "WALLET_EXP - WALLET_MARGIN_S" in code and "resubmitting with a" in code
+    assert "PULL_RESUBMITS = 3" in code and "resubmits < PULL_RESUBMITS" in code
