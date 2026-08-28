@@ -82,3 +82,29 @@ complete copy-paste walkthrough for newcomers (every command, every gotcha).
 See **[DEVELOPER.md](DEVELOPER.md)** for the complete operating manual, and
 **[MECHANISMS.md](MECHANISMS.md)** for how the platform works internally
 (add/remove steps, enhancement, runtime config flow, multi-tenant safety).
+## Running steps on MeluXina (HPC)
+
+When the project's pool is HPC-enabled, every step's `{step}-class` dropdown on the
+Argo submit form also offers the MeluXina classes:
+
+| class | what it is | typical use |
+|---|---|---|
+| `meluxina-gpu` | 4× A100-40GB, 2× EPYC 7452, 512 GB | training, QAT fine-tune |
+| `meluxina-cpu` | 2× EPYC 7452 (128 cores), 512 GB | heavy preprocessing, PTQ export |
+| `meluxina-largemem` | 4 TB RAM | datasets that do not fit a node |
+
+Pick one for a step and only that step runs as a Slurm job on MeluXina; every other
+step keeps its in-cluster class — mixing (training on `meluxina-gpu`, quantization on
+`gpu-small`, registration in-cluster) is the normal case. Nothing in this repository
+changes: the platform stages the dataset ref to Lustre, pulls the step image into an
+Apptainer SIF, runs the same command the pod would run, and brings the step's declared
+outputs back so the next step consumes them as usual. MLflow and lakeFS are reached
+through the public endpoints with a short-lived token minted per job.
+
+- Queue time is real (minutes to hours) — the pipeline waits for you; the
+  `pipeline-info` field on the form lists the classes and the account.
+- Give long steps a wall-clock limit in `pipeline.py`: `step(..., hpc_time_limit="12h")`
+  (default 4 h). See [DEVELOPER.md §8.1](DEVELOPER.md).
+- Dataset layout is unchanged: `s3://{repo}/{ref}/dataset/{version}/`.
+- Steps pinned with a `compute-class` annotation stay in-cluster.
+
