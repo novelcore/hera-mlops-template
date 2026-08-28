@@ -267,6 +267,21 @@ def hdrs():
             'Content-Type': 'application/json'}
 
 
+def hpc_class():
+    """The HPC class this twin runs on (its {step}-class value), resolved
+    against the catalog the enhancer embedded. Unknown class = render/
+    submit mismatch, never a silent default partition."""
+    name = os.environ.get('HPC_CLASS') or ''
+    for c in json.loads(os.environ.get('HPC_CLASSES_JSON') or '[]'):
+        if c.get('name') == name:
+            return c
+    print('unknown HPC class', repr(name), '- catalog:',
+          [c.get('name') for c in json.loads(os.environ.get('HPC_CLASSES_JSON') or '[]')],
+          flush=True)
+    sys.exit(2)
+
+
+
 def get(url):
     return json.load(urllib.request.urlopen(
         urllib.request.Request(url, headers=hdrs()), timeout=30))
@@ -303,6 +318,7 @@ def find_active():
 
 
 def submit():
+    HPC = hpc_class()
     reg = ''
     try:
         r = urllib.request.Request(
@@ -366,9 +382,12 @@ def submit():
         'fi',
         # Start in the image's WORKDIR (Apptainer ignores it; Docker does not).
         'PWD_OPT=""; [ -n "$STEP_WORKDIR" ] && PWD_OPT="--pwd $STEP_WORKDIR"',
-        'if [ -n "$STEP_CMD" ]; then apptainer exec --nv $PWD_OPT $BIND "$SIF"'
-        ' /bin/sh -c "$STEP_CMD"; else apptainer exec --nv $PWD_OPT $BIND "$SIF"'
-        ' nvidia-smi -L; fi',
+        # --nv only on GPU classes: on the cpu/largemem partitions there is
+        # no driver to bind and the flag makes Apptainer warn or fail.
+        'NV=""; [ "${HPC_GPUS:-0}" -gt 0 ] && NV="--nv"',
+        'if [ -n "$STEP_CMD" ]; then apptainer exec $NV $PWD_OPT $BIND "$SIF"'
+        ' /bin/sh -c "$STEP_CMD"; else apptainer exec $NV $PWD_OPT $BIND "$SIF"'
+        ' /bin/sh -c "nvidia-smi -L || nproc"; fi',
         'rc=$?',
         'if [ -n "$STEP_OUTPUTS" ] && [ -n "$STAGEOUT_B64" ] && [ -n "$LAKEFS_BEARER_TOKEN" ]; then'
         ' printf %s "$STAGEOUT_B64" | base64 -d | python3 - || echo "stage-out failed (rc=$rc)"; fi',
@@ -378,6 +397,7 @@ def submit():
     ])
     env = ['PATH=/usr/bin:/bin:/usr/local/bin', 'HOME=/home/users/u104378',
            'USER=u104378', 'IMAGE_REF=' + img, 'REG_TOKEN=' + reg,
+           'HPC_GPUS=' + str(HPC.get('gpus') or 0),
            'STEP_CMD=' + cmd, 'STEP_WORKDIR=' + fetch_workdir(img, reg),
            'WF_UID=' + (os.environ.get('WF_UID') or ''),
            'STEP_NAME=' + (os.environ.get('STEP_NAME') or ''),
@@ -403,8 +423,9 @@ def submit():
                     + base64.b64encode(STAGEIN.encode()).decode(),
                     'STAGEOUT_B64='
                     + base64.b64encode(STAGEOUT.encode()).decode()]
-    body = {'job': {'name': jobname, 'partition': 'gpu',
-                    'account': 'p201342', 'qos': 'default',
+    body = {'job': {'name': jobname, 'partition': HPC['partition'],
+                    'account': os.environ.get('HPC_ACCOUNT') or 'p201342',
+                    'qos': HPC.get('qos') or 'default',
                     'time_limit': int(os.environ.get('SLURM_TIME_LIMIT') or 240),
                     'current_working_directory': '/home/users/u104378',
                     'environment': env, 'tasks': 1, 'nodes': '1'},
@@ -606,21 +627,55 @@ def step_time_limit(step: dict) -> int:
     return parse_time_limit(raw) if raw not in (None, "") else DEFAULT_TIME_LIMIT_MINUTES
 
 
-def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None:
-    """Route GPU steps to MeluXina behind the `target` param (module doc)."""
+HPC_CLASS_PREFIX_FMT = "%s-"  # class names are provider-prefixed: meluxina-gpu
+
+
+def hpc_classes(ctx: dict) -> list:
+    """The HPC compute classes the account can use, from the pipeline
+    context (k8smlapp composition, gated on hpcReady). Each entry:
+    {name, tier, partition, qos, gpus, cpus, memoryGiB, description}."""
     hpc = ctx.get("hpc") or {}
     if not hpc.get("enabled"):
-        return
-    provider = hpc.get("provider", "meluxina")
+        return []
+    return [dict(c) for c in (hpc.get("classes") or []) if c.get("name")]
 
+
+def _when_expr(when: str) -> str:
+    """Translate a simple-tag `when` ({{workflow.parameters.X}} == Y / != Y)
+    into an Argo expression; an expression `when` ({{=...}}) is passed
+    through. Anything else fails the render loudly: a silently dropped gate
+    would run a step the author disabled."""
+    w = (when or "").strip()
+    if not w:
+        return ""
+    if w.startswith("{{=") and w.endswith("}}"):
+        return w[3:-2].strip()
+    m = re.match(r"^\{\{\s*workflow\.parameters\.([A-Za-z0-9_.-]+)\s*\}\}\s*(==|!=)\s*(\S+)$", w)
+    if not m:
+        raise ValueError(
+            "meluxina: cannot combine the step's when %r with the HPC class gate — "
+            "use {{workflow.parameters.X}} == Y / != Y or an {{= expression }}" % when)
+    param, op, value = m.groups()
+    value = value.strip("'\"")
+    return "workflow.parameters['%s'] %s '%s'" % (param, op, value)
+
+
+def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None:
+    """Per-step HPC placement (PRD kubecore-operator#1191). Every step's
+    {step}-class dropdown carries the HPC classes (enhance_class_param);
+    here each un-pinned step gets a Slurm twin, and the pair is gated on
+    the chosen class: in-cluster when the class is not HPC, twin when it is.
+    A step's own `when` is preserved on both."""
+    classes = hpc_classes(ctx)
+    if not classes:
+        return
+    provider = (ctx.get("hpc") or {}).get("provider", "meluxina")
+    prefix = HPC_CLASS_PREFIX_FMT % provider
+    by_class = {c["name"]: c for c in classes}
+
+    # The global `target` switch is gone: placement is per step.
     parameters = spec["arguments"]["parameters"]
-    if not any(p.get("name") == "target" for p in parameters):
-        parameters.append({
-            "name": "target", "value": "gcp", "enum": ["gcp", provider],
-            "description": ("Computation target for this run. gcp = "
-                            "in-cluster pools; %s = HPC burst (GPU training "
-                            "runs on %s via Slurm)." % (provider, provider)),
-        })
+    parameters[:] = [p for p in parameters if p.get("name") != "target"]
 
     entry = spec.get("entrypoint")
     dag_tpl = next((t for t in spec.get("templates", [])
@@ -634,20 +689,17 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
     outputs_union: set = set()
     for task in list(tasks):
         step = by_tpl.get(task.get("template"))
-        if step is None or step["name"] not in gpu_step_names or task.get("when"):
+        if step is None:
             continue
-        task["when"] = "{{=workflow.parameters.target != '%s'}}" % provider
+        annots = (step.get("metadata") or {}).get("annotations") or {}
+        if "platform.kubecore.io/compute-class" in annots:
+            continue  # pinned to one in-cluster class: no HPC twin
+        class_param = "workflow.parameters['%s-class']" % step["name"]
+        own = _when_expr(task.get("when", ""))
+        hpc_gate = "hasPrefix(%s, '%s')" % (class_param, prefix)
+        task["when"] = "{{=%s!%s}}" % ("(%s) && " % own if own else "", hpc_gate)
+        twin_when = "{{=%s%s}}" % ("(%s) && " % own if own else "", hpc_gate)
         container = step.get("container") or {}
-        # step-command: {{inputs.parameters.X}} tokens resolve against the
-        # STEP template's inputs — copied verbatim into a task argument they
-        # fail spec validation for the entire WorkflowTemplate (live-caught
-        # 2026-08-25: one templated token bricked every submission, gcp runs
-        # included). But the DAG task's OWN arguments carry each input's
-        # value (a literal or a task-context-valid expression like
-        # {{workflow.parameters.x}}), so substituting from them yields the
-        # real invocation (F-04). Anything still step-scoped after
-        # substitution is dropped; an empty result falls back to the
-        # in-template nvidia-smi probe.
         argmap = {p.get("name"): str(p.get("value", ""))
                   for p in ((task.get("arguments") or {}).get("parameters")
                             or [])}
@@ -664,7 +716,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
         twin = {
             "name": task["name"] + "-" + provider,
             "template": "meluxina-run",
-            "when": "{{=workflow.parameters.target == '%s'}}" % provider,
+            "when": twin_when,
             "arguments": {"parameters": [
                 {"name": "step-name", "value": task["name"]},
                 {"name": "image", "value": container.get("image", "")},
@@ -673,6 +725,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
                 {"name": "deadline-seconds",
                  "value": str((minutes + QUEUE_ALLOWANCE_MINUTES) * 60)},
                 {"name": "step-outputs", "value": ",".join(step_outputs)},
+                {"name": "hpc-class", "value": "{{workflow.parameters.%s-class}}" % step["name"]},
             ]},
         }
         if task.get("depends"):
@@ -703,12 +756,14 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
 
     # A bare task token in Argo depends grammar means Succeeded; a routed dep
     # is now a twin pair where exactly one twin runs and the other is Skipped.
+    # Twins included: a twin whose upstream also ran on HPC must depend on
+    # the upstream PAIR, not on the (Skipped) in-cluster task.
     for task in tasks:
         dep = task.get("depends")
-        if not dep or task["name"].endswith("-" + provider):
+        if not dep:
             continue
         for r in routed:
-            if task["name"] == r:
+            if task["name"] in (r, r + "-" + provider):
                 continue
             pair = ("((%s.Succeeded || %s.Skipped) && "
                     "(%s-%s.Succeeded || %s-%s.Skipped))"
@@ -735,7 +790,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
         "inputs": {"parameters": [
             {"name": "step-name"}, {"name": "image"}, {"name": "step-command"},
             {"name": "time-limit"}, {"name": "deadline-seconds"},
-            {"name": "step-outputs", "value": ""}]},
+            {"name": "step-outputs", "value": ""}, {"name": "hpc-class"}]},
         # Per-step: Slurm time limit + queue/prep allowance (see
         # QUEUE_ALLOWANCE_MINUTES). Argo resolves the parameter here.
         "activeDeadlineSeconds": "{{inputs.parameters.deadline-seconds}}",
@@ -744,7 +799,8 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
         # workflow-uid name, so a retried waiter re-attaches instead of
         # submitting a duplicate.
         "retryStrategy": {"limit": "2", "retryPolicy": "OnError"},
-        "metadata": {"labels": {"platform.kubecore.io/compute-type": "hpc"}},
+        "metadata": {"labels": {"platform.kubecore.io/compute-type": "hpc",
+                                "platform.kubecore.io/hpc-class": "{{inputs.parameters.hpc-class}}"}},
         "volumes": [{"name": "mlflow-svc", "secret": {
             "secretName": str(mlflow_ctx.get("svcSecret") or "mlflow-svc"),
             "optional": True}},
@@ -770,6 +826,9 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
                 {"name": "STEP_COMMAND", "value": "{{inputs.parameters.step-command}}"},
                 {"name": "SLURM_TIME_LIMIT", "value": "{{inputs.parameters.time-limit}}"},
                 {"name": "STEP_OUTPUTS", "value": "{{inputs.parameters.step-outputs}}"},
+                {"name": "HPC_CLASS", "value": "{{inputs.parameters.hpc-class}}"},
+                {"name": "HPC_CLASSES_JSON", "value": json.dumps(classes, separators=(",", ":"))},
+                {"name": "HPC_ACCOUNT", "value": str((ctx.get("hpc") or {}).get("account") or "")},
                 {"name": "ZITADEL_MACHINE_KEY_FILE",
                  "value": "/etc/mlflow-svc/ZITADEL_MACHINE_KEY"},
                 {"name": "ZITADEL_DOMAIN",
