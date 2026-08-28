@@ -491,6 +491,35 @@ def test_twin_command_picks_the_upstream_twin_that_ran():
     assert "{{=toJson(tasks['model-training'].outputs.parameters['training-result'])}}" in cmd
 
 
+def test_status_qualified_depends_name_the_twin():
+    """Live wf b6qlj/f9kr8 (2026-08-28, argo v4.0.6): model-quantization
+    depended on `qat-finetune.Succeeded || qat-finetune.Skipped || qat-finetune.Omitted`
+    while its args picked tasks['qat-finetune-meluxina'] — Argo exposes tasks.X
+    only for X in depends, so the DAG hung on "tasks.qat-finetune-meluxina is
+    missing". Every status-qualified reference to a routed step must name the
+    twin with pair semantics (Succeeded = either, Skipped/Omitted = both)."""
+    raw = _raw()
+    dag = next(t for t in raw["spec"]["templates"] if t["name"] == "p")
+    reg = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-registration")
+    reg["depends"] = "model-training && (qat-finetune.Succeeded || qat-finetune.Skipped || qat-finetune.Omitted)"
+    out = enhance(raw, _ctx())
+    dag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
+    tasks = {t["name"]: t for t in dag["dag"]["tasks"]}
+    expected = ("((model-training.Succeeded || model-training.Skipped) && "
+                "(model-training-meluxina.Succeeded || model-training-meluxina.Skipped)) && "
+                "((qat-finetune.Succeeded || qat-finetune-meluxina.Succeeded) || "
+                "(qat-finetune.Skipped && qat-finetune-meluxina.Skipped) || "
+                "(qat-finetune.Omitted && qat-finetune-meluxina.Omitted))")
+    assert tasks["model-registration"]["depends"] == expected
+    assert tasks["model-registration-meluxina"]["depends"] == expected  # twin waits on the same pairs
+    # every task referenced by a pair expression in the args is a declared dependency
+    import re
+    for name in ("model-registration", "model-registration-meluxina"):
+        refs = set(re.findall(r"tasks\['([\w-]+)'\]", json.dumps(tasks[name].get("arguments", {}))))
+        deps = set(re.findall(r"(?<![\w.-])([A-Za-z0-9_-]+)\.(?:Succeeded|Skipped|Omitted)", tasks[name]["depends"]))
+        assert refs <= deps, (name, refs - deps)
+
+
 def test_stage_out_batch_and_waiter_invariants():
     from kubecore.meluxina import MELUXINA_SUBMIT_CODE as code
     import ast, re

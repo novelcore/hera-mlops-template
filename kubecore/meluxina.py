@@ -784,6 +784,19 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
     # is now a twin pair where exactly one twin runs and the other is Skipped.
     # Twins included: a twin whose upstream also ran on HPC must depend on
     # the upstream PAIR, not on the (Skipped) in-cluster task.
+    # Status-qualified references (qat-finetune.Succeeded || qat-finetune.Skipped
+    # || qat-finetune.Omitted) must name the twin too: Argo exposes tasks.X to
+    # a task's expressions ONLY for X in its depends, so a consumer whose
+    # args pick tasks['X-meluxina'] hangs forever with "tasks.X-meluxina is
+    # missing" (live wf b6qlj/f9kr8 2026-08-28, argo v4.0.6). Pair semantics:
+    # Succeeded/Failed/Errored/Daemoned = either twin; Skipped/Omitted = both.
+    def _status_pair(r):
+        def sub(m):
+            st = m.group(1)
+            op = "&&" if st in ("Skipped", "Omitted") else "||"
+            return "(%s.%s %s %s-%s.%s)" % (r, st, op, r, provider, st)
+        return sub
+
     for task in tasks:
         dep = task.get("depends")
         if not dep:
@@ -791,6 +804,8 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
         for r in routed:
             if task["name"] in (r, r + "-" + provider):
                 continue
+            dep = re.sub(r"(?<![\w.-])%s\.(Succeeded|Skipped|Omitted|Failed|Errored|Daemoned)(?![\w.-])"
+                         % re.escape(r), _status_pair(r), dep)
             pair = ("((%s.Succeeded || %s.Skipped) && "
                     "(%s-%s.Succeeded || %s-%s.Skipped))"
                     % (r, r, r, provider, r, provider))
