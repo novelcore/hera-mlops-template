@@ -568,9 +568,26 @@ def _tag_expr(path: str) -> str:
     return out
 
 
-def _cmd_json(cmd: list) -> str:
+_TASK_OUTPUT = re.compile(r"^tasks\.([A-Za-z0-9_-]+)\.outputs\.parameters\.([A-Za-z0-9_.-]+)$")
+
+
+def _pair_expr(task: str, param: str, provider: str) -> str:
+    """Expression for a routed upstream's output: exactly one twin ran, the
+    other is Skipped and its outputs resolve to their defaults — pick the
+    twin that ran."""
+    return ("tasks['%s'].status == 'Skipped' ? tasks['%s-%s'].outputs."
+            "parameters['%s'] : tasks['%s'].outputs.parameters['%s']"
+            % (task, task, provider, param, task, param))
+
+
+def _cmd_json(cmd: list, routed=(), provider: str = "") -> str:
     """Render the step-command as a JSON array that STAYS valid JSON after
     Argo's parameter substitution.
+
+    References to a routed upstream's outputs are pair-aware (`_pair_expr`):
+    a twin whose upstream ALSO ran on HPC must read the upstream twin, not
+    the Skipped in-cluster task (live wf 9xwb4 2026-08-28: qat-finetune on
+    MeluXina got --training-result "" and fine-tuned the base weights).
 
     A naive json.dumps breaks at run time (live wf mgznz 2026-08-25): Argo
     substitutes {{workflow.parameters.X}} / {{tasks.X.outputs.parameters.Y}}
@@ -591,10 +608,17 @@ def _cmd_json(cmd: list) -> str:
         for m in _SUBST_TAG.finditer(tok):
             if m.start() > pos:
                 exprs.append("'%s'" % tok[pos:m.start()].replace("\\", "\\\\").replace("'", "\\'"))
-            exprs.append(_tag_expr(m.group(1)))
+            ref = _TASK_OUTPUT.match(m.group(1))
+            if ref and ref.group(1) in routed:
+                exprs.append(("(%s)", _pair_expr(ref.group(1), ref.group(2), provider)))
+            else:
+                exprs.append(_tag_expr(m.group(1)))
             pos = m.end()
         if pos < len(tok):
             exprs.append("'%s'" % tok[pos:].replace("\\", "\\\\").replace("'", "\\'"))
+        # a ternary needs parentheses only when concatenated with literals
+        exprs = [(e[0] % e[1] if len(exprs) > 1 else e[1]) if isinstance(e, tuple) else e
+                 for e in exprs]
         parts.append("{{=toJson(%s)}}" % " + ".join(exprs))
     return "[" + ", ".join(parts) + "]"
 
@@ -685,15 +709,19 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
     tasks = dag_tpl["dag"]["tasks"]
     by_tpl = {s["name"]: s for s in steps}
 
+    def _routable(task):
+        step = by_tpl.get(task.get("template"))
+        annots = ((step or {}).get("metadata") or {}).get("annotations") or {}
+        # pinned to one in-cluster class: no HPC twin
+        return step is not None and "platform.kubecore.io/compute-class" not in annots
+
+    routable = {t["name"] for t in tasks if _routable(t)}
     routed = []
     outputs_union: set = set()
     for task in list(tasks):
-        step = by_tpl.get(task.get("template"))
-        if step is None:
+        if task["name"] not in routable:
             continue
-        annots = (step.get("metadata") or {}).get("annotations") or {}
-        if "platform.kubecore.io/compute-class" in annots:
-            continue  # pinned to one in-cluster class: no HPC twin
+        step = by_tpl[task["template"]]
         class_param = "workflow.parameters['%s-class']" % step["name"]
         own = _when_expr(task.get("when", ""))
         hpc_gate = "hasPrefix(%s, '%s')" % (class_param, prefix)
@@ -720,7 +748,8 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
             "arguments": {"parameters": [
                 {"name": "step-name", "value": task["name"]},
                 {"name": "image", "value": container.get("image", "")},
-                {"name": "step-command", "value": _cmd_json(cmd)},
+                {"name": "step-command",
+                 "value": _cmd_json(cmd, routed=routable, provider=provider)},
                 {"name": "time-limit", "value": str(minutes)},
                 {"name": "deadline-seconds",
                  "value": str((minutes + QUEUE_ALLOWANCE_MINUTES) * 60)},
@@ -740,10 +769,7 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
     # Exactly one twin ran; the other is Skipped and its outputs resolve to
     # their declared defaults ("{}"). Pick the twin that actually ran.
     def _pick(m):
-        r, p = m.group(1), m.group(2)
-        return ("{{=tasks['%s'].status == 'Skipped' ? tasks['%s-%s'].outputs."
-                "parameters['%s'] : tasks['%s'].outputs.parameters['%s']}}"
-                % (r, r, provider, p, r, p))
+        return "{{=%s}}" % _pair_expr(m.group(1), m.group(2), provider)
     ref_re = re.compile(r"\{\{\s*tasks\.(%s)\.outputs\.parameters\.([A-Za-z0-9_.-]+)\s*\}\}"
                         % "|".join(re.escape(r) for r in routed))
     for task in tasks:

@@ -449,6 +449,48 @@ def test_stage_out_rewrites_downstream_references_to_the_twin_that_ran():
         "tasks['dataset-loading'].outputs.parameters['params']}}")
 
 
+def test_twin_command_picks_the_upstream_twin_that_ran():
+    """Live wf yolohpc-gpu-steps-meluxina-9xwb4 (2026-08-28): qat-finetune on
+    MeluXina got --training-result "" — its twin's command referenced the
+    in-cluster model-training task, Skipped because training ran on MeluXina
+    too — and fine-tuned the base weights. Twin commands must pick the
+    upstream twin that ran, exactly like in-cluster consumers do."""
+    raw = _raw_with_outputs()
+    tpl = next(t for t in raw["spec"]["templates"] if t["name"] == "qat-finetune")
+    tpl["inputs"] = {"parameters": [{"name": "training-result"}]}
+    tpl["container"]["args"] = ["--training-result", "{{inputs.parameters.training-result}}",
+                                "--from={{inputs.parameters.training-result}}"]
+    dag = next(t for t in raw["spec"]["templates"] if t["name"] == "p")
+    qat = next(t for t in dag["dag"]["tasks"] if t["name"] == "qat-finetune")
+    qat["arguments"] = {"parameters": [
+        {"name": "training-result", "value": "{{tasks.model-training.outputs.parameters.training-result}}"}]}
+    out = enhance(raw, _ctx())
+    dag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
+    twin = next(t for t in dag["dag"]["tasks"] if t["name"] == "qat-finetune-meluxina")
+    cmd = {p["name"]: p["value"] for p in twin["arguments"]["parameters"]}["step-command"]
+    pick = ("tasks['model-training'].status == 'Skipped' ? "
+            "tasks['model-training-meluxina'].outputs.parameters['training-result'] : "
+            "tasks['model-training'].outputs.parameters['training-result']")
+    assert "{{=toJson(%s)}}" % pick in cmd                    # pure-tag token
+    assert "{{=toJson('--from=' + (%s))}}" % pick in cmd      # mixed token: ternary parenthesised
+    assert "toJson(tasks['model-training'].outputs" not in cmd  # no Skipped-blind reference survives
+    # a pinned (never routed) upstream keeps the plain reference
+    raw = _raw_with_outputs()
+    next(t for t in raw["spec"]["templates"] if t["name"] == "model-training")["metadata"] = {
+        "annotations": {"platform.kubecore.io/compute-class": "gpu-t4"}}
+    tpl = next(t for t in raw["spec"]["templates"] if t["name"] == "qat-finetune")
+    tpl["inputs"] = {"parameters": [{"name": "training-result"}]}
+    tpl["container"]["args"] = ["--training-result", "{{inputs.parameters.training-result}}"]
+    dag = next(t for t in raw["spec"]["templates"] if t["name"] == "p")
+    next(t for t in dag["dag"]["tasks"] if t["name"] == "qat-finetune")["arguments"] = {"parameters": [
+        {"name": "training-result", "value": "{{tasks.model-training.outputs.parameters.training-result}}"}]}
+    out = enhance(raw, _ctx())
+    dag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
+    twin = next(t for t in dag["dag"]["tasks"] if t["name"] == "qat-finetune-meluxina")
+    cmd = {p["name"]: p["value"] for p in twin["arguments"]["parameters"]}["step-command"]
+    assert "{{=toJson(tasks['model-training'].outputs.parameters['training-result'])}}" in cmd
+
+
 def test_stage_out_batch_and_waiter_invariants():
     from kubecore.meluxina import MELUXINA_SUBMIT_CODE as code
     import ast, re
