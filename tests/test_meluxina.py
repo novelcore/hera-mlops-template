@@ -42,33 +42,62 @@ def _ctx(hpc=True):
     return ctx
 
 
-def test_hpc_routes_gpu_step_behind_target_param():
-    out = enhance(copy.deepcopy(_raw()), _ctx())
-    spec = out["spec"]
-    params = {p["name"]: p for p in spec["arguments"]["parameters"]}
-    tpls = {t["name"]: t for t in spec["templates"]}
-    tasks = {t["name"]: t for t in tpls["p"]["dag"]["tasks"]}
+def test_hpc_classes_route_every_step_per_class():
+    """PRD kubecore-operator#1191: no global target — every un-pinned step
+    gets a Slurm twin, the pair is gated on the step's own {step}-class
+    value, and every {step}-class dropdown offers the HPC classes."""
+    out = enhance(_raw(), _ctx())
+    params = {p["name"]: p for p in out["spec"]["arguments"]["parameters"]}
+    assert "target" not in params
+    hpc_names = {"meluxina-gpu", "meluxina-cpu", "meluxina-largemem"}
+    for step in ("dataset-loading", "model-training", "qat-finetune", "model-registration"):
+        assert hpc_names <= set(params[f"{step}-class"]["enum"]), step
+    dag = next(t for t in out["spec"]["templates"] if t["name"] == "p")
+    tasks = {t["name"]: t for t in dag["dag"]["tasks"]}
+    for step in ("dataset-loading", "model-training", "model-registration"):
+        gate = f"hasPrefix(workflow.parameters['{step}-class'], 'meluxina-')"
+        assert tasks[step]["when"] == "{{=!%s}}" % gate
+        assert tasks[f"{step}-meluxina"]["when"] == "{{=%s}}" % gate
+        assert tasks[f"{step}-meluxina"]["template"] == "meluxina-run"
+        args = {p["name"]: p["value"] for p in tasks[f"{step}-meluxina"]["arguments"]["parameters"]}
+        assert args["hpc-class"] == "{{workflow.parameters.%s-class}}" % step
+    # a step with its own when keeps that gate on BOTH twins
+    own = "(workflow.parameters.quantization-mode == 'qat')"  # fixture gate is {{= }} form: passed through
+    gate = "hasPrefix(workflow.parameters['qat-finetune-class'], 'meluxina-')"
+    assert tasks["qat-finetune"]["when"] == "{{=%s && !%s}}" % (own, gate)
+    assert tasks["qat-finetune-meluxina"]["when"] == "{{=%s && %s}}" % (own, gate)
+    # the twin's depends is the original's; downstream deps see the pair
+    pair = ("((dataset-loading.Succeeded || dataset-loading.Skipped) && "
+            "(dataset-loading-meluxina.Succeeded || dataset-loading-meluxina.Skipped))")
+    assert tasks["model-training"]["depends"] == pair
+    assert tasks["model-training-meluxina"]["depends"] == pair  # twin waits for the upstream PAIR too
+    run = next(t for t in out["spec"]["templates"] if t["name"] == "meluxina-run")
+    env = {e["name"]: e.get("value") for e in run["container"]["env"]}
+    assert env["HPC_CLASS"] == "{{inputs.parameters.hpc-class}}"
+    assert json.loads(env["HPC_CLASSES_JSON"])[0]["name"] == "meluxina-gpu"
+    assert run["metadata"]["labels"]["platform.kubecore.io/hpc-class"] == "{{inputs.parameters.hpc-class}}"
+    info = params["pipeline-info"]["value"]
+    assert "MELUXINA (HPC)" in info and "meluxina-largemem" in info
 
-    assert params["target"]["enum"] == ["gcp", "meluxina"]
-    assert "!= 'meluxina'" in tasks["model-training"]["when"]
-    mel = tasks["model-training-meluxina"]
-    assert "== 'meluxina'" in mel["when"]
-    assert mel["template"] == "meluxina-run"
-    # quantization-gated GPU step keeps in-cluster-only behaviour this slice
-    assert "qat-finetune-meluxina" not in tasks
-    # downstream depends gate on the Succeeded||Skipped twin pair
-    reg = tasks["model-registration"]["depends"]
-    assert "(model-training.Succeeded || model-training.Skipped)" in reg
-    assert "model-training-meluxina.Succeeded" in reg
-    # release gate: container template, never script; no duplicate params
-    mr = tpls["meluxina-run"]
-    assert "container" in mr and "script" not in mr
-    names = [p["name"] for p in spec["arguments"]["parameters"]]
-    assert len(names) == len(set(names))
-    # idempotent submit + operational lessons encoded in the program
-    src = mr["container"]["command"][2]
-    assert "adopting existing job" in src and "sif-cache" in src and "bash -l" in src
-    assert "{{" not in src
+
+def test_when_expr_translation_and_refusal():
+    import pytest
+    from kubecore.meluxina import _when_expr
+    assert _when_expr("") == ""
+    assert _when_expr("{{workflow.parameters.quantization-mode}} == qat") == "workflow.parameters['quantization-mode'] == 'qat'"
+    assert _when_expr("{{workflow.parameters.mode}} != 'none'") == "workflow.parameters['mode'] != 'none'"
+    assert _when_expr("{{= workflow.parameters.x == 'y' }}") == "workflow.parameters.x == 'y'"
+    with pytest.raises(ValueError):
+        _when_expr("{{tasks.a.outputs.result}} == b")
+
+
+def test_submit_code_places_the_job_by_class():
+    from kubecore.meluxina import MELUXINA_SUBMIT_CODE as code
+    assert "def hpc_class():" in code and "HPC = hpc_class()" in code.split("def submit():", 1)[1]
+    assert "'partition': HPC['partition']" in code and "os.environ.get('HPC_ACCOUNT') or 'p201342'" in code
+    assert "'HPC_GPUS=' + str(HPC.get('gpus') or 0)" in code
+    assert 'NV=""; [ "${HPC_GPUS:-0}" -gt 0 ] && NV="--nv"' in code
+    assert "apptainer exec --nv" not in code
 
 
 def test_twin_arguments_never_carry_step_scoped_tags():
@@ -398,9 +427,8 @@ def test_stage_out_declares_step_outputs_on_the_runner_and_twin():
     twin = next(t for t in dag["dag"]["tasks"] if t["name"] == "model-training-meluxina")
     args = {p["name"]: p["value"] for p in twin["arguments"]["parameters"]}
     assert args["step-outputs"] == "training-result"
-    # qat-finetune carries its own `when` in the fixture, so it is not routed
-    # (existing contract) — no twin, nothing to assert about its outputs.
-    assert not any(t["name"] == "qat-finetune-meluxina" for t in dag["dag"]["tasks"])
+    qat_twin = next(t for t in dag["dag"]["tasks"] if t["name"] == "qat-finetune-meluxina")
+    assert {p["name"]: p["value"] for p in qat_twin["arguments"]["parameters"]}["step-outputs"] == ""
     env = {e["name"]: e.get("value") for e in run["container"]["env"]}
     assert env["STEP_OUTPUTS"] == "{{inputs.parameters.step-outputs}}"
 
@@ -414,8 +442,11 @@ def test_stage_out_rewrites_downstream_references_to_the_twin_that_ran():
         "{{=tasks['model-training'].status == 'Skipped' ? "
         "tasks['model-training-meluxina'].outputs.parameters['training-result'] : "
         "tasks['model-training'].outputs.parameters['training-result']}}")
-    # references to un-routed steps are left alone
-    assert args["params"] == "{{tasks.dataset-loading.outputs.parameters.params}}"
+    # every routed step's outputs are picked from the twin that ran
+    assert args["params"] == (
+        "{{=tasks['dataset-loading'].status == 'Skipped' ? "
+        "tasks['dataset-loading-meluxina'].outputs.parameters['params'] : "
+        "tasks['dataset-loading'].outputs.parameters['params']}}")
 
 
 def test_stage_out_batch_and_waiter_invariants():

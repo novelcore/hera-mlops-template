@@ -277,22 +277,35 @@ exact section and step named (see §10) — nothing silently breaks.
 
 ---
 
-### 8.1 HPC target (MeluXina) time limit
+### 8.1 Running steps on MeluXina (HPC classes)
 
-When the project's pool is HPC-enabled, every `gpu=True` step gets a `target`
-dropdown (`gcp` | `meluxina`). On `meluxina` the step runs as a Slurm job whose
-wall-clock limit defaults to 4 h — set it per step for real trainings:
+When the project's pool is HPC-enabled, every step's `{step}-class` dropdown
+also offers the MeluXina classes — `meluxina-gpu` (4× A100-40GB), `meluxina-cpu`
+(2× EPYC 7452, 128 cores, 512 GB), `meluxina-largemem` (4 TB). Pick one for a
+step and that step runs as a Slurm job on MeluXina; every other step keeps its
+in-cluster class. There is no global switch: placement is per step, per run
+(training on `meluxina-gpu`, quantization on `gpu-small`, registration
+in-cluster is a normal combination).
+
+What the platform does for an HPC-placed step: waits in the queue on your
+behalf, stages the dataset ref to Lustre (cached), pulls the step image into an
+Apptainer SIF (cached), runs the same command the pod would run, uploads the
+step's declared outputs to lakeFS and hands them to the next step exactly as
+if it had run in the cluster. MLflow and lakeFS are reached through the
+public endpoints with a short-lived token minted per job.
+
+Give long steps a wall-clock limit (default 4 h):
 
 ```python
 train = step("model-training", gpu=True, needs=[load], hpc_time_limit="12h",
              reads=["experiment", "data", "model", "train"])
 ```
 
-`hpc_time_limit` takes minutes or hours (`"90m"`, `"12h"`, `"720"`). Slurm
-kills the job when it elapses, so size it to your longest expected epoch
-budget. The platform adds a queue/prep allowance on top for the Argo side; a
-run that outlives that budget keeps running on MeluXina but is no longer
-observed by the pipeline (no registration step), so do not under-size it.
+`hpc_time_limit` takes minutes or hours (`"90m"`, `"12h"`, `"720"`); Slurm kills
+the job when it elapses. The platform adds a queue allowance on top for its own
+wait budget; a run that outlives that budget keeps running on MeluXina but is
+no longer observed by the pipeline. Queue time is the one variable you don't
+control — expect minutes to hours depending on the partition's load.
 
 ## 9. Data flow between steps
 

@@ -109,6 +109,34 @@ computeClasses:
 hpc:
   enabled: true
   provider: "meluxina"
+  # account + classes are published by the k8smlapp composition from the
+  # pool's HPC bridge (kubecore-operator#1191); placeholder shape only.
+  account: "PLACEHOLDER-account"
+  classes:
+  - name: meluxina-gpu
+    tier: gpu
+    partition: gpu
+    qos: default
+    gpus: 4
+    cpus: 128
+    memoryGiB: 512
+    description: "4x A100-40GB, 2x EPYC 7452, 512 GB"
+  - name: meluxina-cpu
+    tier: cpu
+    partition: cpu
+    qos: default
+    gpus: 0
+    cpus: 128
+    memoryGiB: 512
+    description: "2x EPYC 7452, 128 cores, 512 GB"
+  - name: meluxina-largemem
+    tier: cpu
+    partition: largemem
+    qos: default
+    gpus: 0
+    cpus: 128
+    memoryGiB: 4096
+    description: "4 TB"
 checkpoints:
   bucket: PLACEHOLDER-bucket
   prefix: main/checkpoints

@@ -60,7 +60,7 @@ from pathlib import Path
 
 import yaml
 
-from kubecore.meluxina import enhance_hpc
+from kubecore.meluxina import enhance_hpc, hpc_classes
 
 ANNOTATION_PREFIX = "platform.kubecore.io/"
 KNOWN_ANNOTATIONS = {"compute-class", "inject", "source", "image", "shm", "workspace", "hpc"}
@@ -393,13 +393,21 @@ def enhance_class_param(spec: dict, step: dict, ctx: dict, annots: dict) -> None
     options = [c["name"] for c in ctx["computeClasses"]["all"]]
     if default not in options:
         options.insert(0, default)
+    # HPC classes (kubecore-operator#1191): every step can be placed on the
+    # HPC provider per run — the class is provider-prefixed (meluxina-gpu),
+    # and kubecore/meluxina.py gates the in-cluster/Slurm twin pair on it.
+    hpc_names = [c["name"] for c in hpc_classes(ctx)]
+    options += [n for n in hpc_names if n not in options]
     param = {
         "name": param_name,
         "value": default,
         "enum": options,
         "description": (
             f"Compute class for the '{step_name}' step "
-            f"(the KubePool's class catalog; default = its {tier} tier)."
+            f"(the KubePool's class catalog; default = its {tier} tier"
+            + ("; meluxina-* classes run the step as a Slurm job on MeluXina — "
+               "queue time applies, see pipeline-info" if hpc_names else "")
+            + ")."
         ),
     }
     parameters.append(param)
@@ -890,6 +898,20 @@ def enhance_pipeline_info(spec: dict, ctx: dict, steps: list) -> None:
         acc = cls.get("guestAccelerator")
         acc_txt = f" + {acc['count']}x {acc['type']}" if acc else ""
         lines.append(f"  - {cls['name']} ({cls.get('tier', 'cpu')}) — {cls['machineType']}{acc_txt}")
+    hpc = hpc_classes(ctx)
+    if hpc:
+        account = (ctx.get("hpc") or {}).get("account") or ""
+        lines.append(
+            "MELUXINA (HPC): pick a meluxina-* class in any {step}-class dropdown and "
+            "that step runs as a Slurm job on MeluXina"
+            + (f" (account {account})" if account else "")
+            + " — queue time applies; the pipeline waits, stages the dataset in and the "
+            "step's outputs back; hpc_time_limit in pipeline.py caps the job. Classes:")
+        for c in hpc:
+            lines.append(f"  - {c['name']} ({c.get('tier', 'cpu')}) — partition {c.get('partition')}"
+                         f"{', ' + str(c.get('gpus')) + ' GPUs' if c.get('gpus') else ''}"
+                         f", {c.get('cpus', '?')} cores, {c.get('memoryGiB', '?')} GiB"
+                         f"{' — ' + c['description'] if c.get('description') else ''}")
     lines.append("STEPS: " + " -> ".join(s["name"] for s in steps))
     lines.append("(This field is informational — leave it unchanged.)")
     parameters.insert(
