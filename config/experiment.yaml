@@ -1,3 +1,3 @@
 experiment:
-  name: "object-pose-v1-yolov8n" # MLflow experiment name and S3 checkpoint path prefix
-  description: "" # optional free text stored in the MLflow run
+  name: "my-experiment-v1" # experiment name (used for tracking + artifact path prefixes)
+  description: "" # optional free text stored with the run

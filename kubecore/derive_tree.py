@@ -173,7 +173,7 @@ def _compose(overrides: list, return_hydra_config: bool = False):
                 return_hydra_config=return_hydra_config,
             )
     except MissingConfigException as exc:
-        # message looks like: In 'config': Could not find 'model/yolov8n'
+        # message looks like: In 'config': Could not find '<group>/<option>'
         raise DeriveError(
             f"config tree is broken: {exc}. A defaults-list entry in config/config.yaml "
             f"points at a group option that no longer exists — restore the option file "

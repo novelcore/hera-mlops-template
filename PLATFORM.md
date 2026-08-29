@@ -1,9 +1,9 @@
-# Hera + Hydra ML pipeline authoring — platform integration
+# Hera + Hydra pipeline authoring — platform integration
 
 How the pieces fit, how a client onboards, and how the platform team operates it.
-This replaces the `kubeline.yaml` DSL: developers author ML pipelines in **Python
-(Hera) + a Hydra config tree**; the platform renders, wires, and delivers the
-Argo `WorkflowTemplate` through the existing GitOps path. Both frontends coexist.
+Developers author pipelines in **Python (Hera) + a Hydra config tree**; the
+platform renders, wires, and delivers the Argo `WorkflowTemplate` through the
+existing GitOps path.
 
 ## The pieces (3 repos + the operator)
 
@@ -64,7 +64,7 @@ runs: Argo UI / agents (workflowTemplateRef); the submit form IS the config tree
   `{app}-pipeline`, so two apps in the same namespace never overwrite each other
   (a template's hardcoded pipeline name can't leak across apps).
 - **App-scoped image ConfigMap**: `{app}-pipeline-images` — no cross-app image bleed.
-- **Slash-anchored gitops discovery**: `*/{app}/{branch}/…` — `yolo` ≠ `yolo-training`.
+- **Slash-anchored gitops discovery**: `*/{app}/{branch}/…` — `app` ≠ `app-training`.
 - **Per-step compute**: each step gets a `{step}-class` dropdown (the KubePool's
   allowed classes) + `{step}-cpu/mem` sizing knobs; GPU steps route to the gpu class.
 - **Credential split**: untrusted `pipeline.py` runs tokenless (no GitHub token, a
@@ -87,23 +87,24 @@ goes through git, by design).
   installs it on every `features.ml=true` KubePool reconcile.
 - **Extend the engine** (schemas, annotations, compute model): see
   `kubecore/README.md`.
-- **Coexistence**: existing `kubeline.yaml` apps are unaffected — `ml-ci-build`
-  detects the frontend and uses the legacy `render-wft` path for them.
+- **Coexistence**: `ml-ci-build` detects each app's frontend and routes it to the
+  matching render path, so apps using other authoring frontends are unaffected.
 
 ## Verification
 
 - Offline: `./run.sh` (render→enhance→compose) and `python tests/test_engine.py`
   (23 assertions) in any app repo.
-- In-cluster (validated live on gke-dev, end-to-end): create KubeApp → operator
-  seeds the app repo → push → CI clone (token) → detect Hera frontend → build all
-  6 step images → **render-hera tokenless** → enhance (forced `{app}-pipeline`
+- In-cluster (validated end-to-end): create KubeApp → operator
+  seeds the app repo → push → CI clone (token) → detect Hera frontend → build the
+  step images → **render-hera tokenless** → enhance (forced `{app}-pipeline`
   name) → gate → commit to gitops → **no Crossplane revert** (WFT/images MRs stay
   Synced) → ArgoCD sync → **submittable** WFT → real run: `compose-and-validate`
-  composed+validated the Hydra config into a real `params.yaml`, `dataset-loading`
-  ran, `model-training` scheduled with the correct GPU request + the CI-built
-  image. The GPU training container itself is gated only on GPU node capacity in
-  the zone (a GCP T4 stockout during validation, not a platform issue).
+  composed+validated the Hydra config into a real `params.yaml`, and the steps
+  ran, with a GPU step scheduled with the correct GPU request + the CI-built
+  image. A GPU container is gated only on GPU node capacity in the zone (an
+  accelerator stockout during validation is not a platform issue).
 - Whole-node GPU sizing: GPU compute-class allocatable subtracts an extra GPU
   node headroom (nvidia device-plugin + driver + larger system reservation) so a
-  training step actually fits a fresh accelerator node — verified live (25 GiB
-  never scheduled a T4 node; the corrected 22 GiB triggered the scale-up).
+  GPU step actually fits a fresh accelerator node — verified in-cluster (an
+  oversized request never scheduled a GPU node; the corrected request triggered
+  the scale-up).

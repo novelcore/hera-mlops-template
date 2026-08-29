@@ -1,6 +1,6 @@
 # Pipeline Developer Guide
 
-The operating manual for authoring and running your ML pipeline. You need
+The operating manual for authoring and running your pipeline. You need
 Python and YAML. You do not need Kubernetes — anything you don't see in
 this guide is handled for you.
 
@@ -15,12 +15,11 @@ your-repo/
 ├── pipeline.py              # the DAG: steps, what they read, how they connect
 ├── config/                  # THE experiment config tree (all your parameters)
 │   ├── config.yaml          #   defaults list (which group options are default)
-│   ├── data.yaml  train.yaml  quantization.yaml  ...
-│   ├── train/optimizer/{sgd,adam,adamw}.yaml     # a config GROUP
-│   └── image_processing/{mosaic_default,...}.yaml
+│   ├── experiment.yaml      #   a section of scalar leaves (add your own)
+│   └── train/optimizer/{sgd,adam,adamw}.yaml     # a config GROUP (example)
 ├── kubecore/                # platform-owned helpers (seeded — do not edit)
 └── steps/
-    ├── model_training/      # Dockerfile + entry point (your code)
+    ├── hello_world/         # Dockerfile + entry point (your code)
     └── ...
 ```
 
@@ -56,10 +55,10 @@ run can be reproduced exactly.
 # config/train.yaml (excerpt — a SECTION with scalar leaves)
 train:
   epochs: 100        # total training epochs
-  batch_size: 16     # -1 for Ultralytics auto-batch
+  batch_size: 16     # -1 for auto-batch
   cos_lr: true       # plain booleans are fine
   loss:
-    pose: 12.0       # nested scalars work too
+    weight: 12.0     # nested scalars work too
 ```
 
 ```yaml
@@ -74,9 +73,9 @@ weight_decay: 0.0005
 # config/config.yaml — the defaults list picks each group's default
 defaults:
   - _self_
+  - experiment
   - train
   - train/optimizer: sgd
-  - image_processing: mosaic_default
   # ...
 ```
 
@@ -85,18 +84,18 @@ What each thing becomes on the submit form:
 | you write in config/ | what happens |
 |---|---|
 | a scalar leaf (`train.epochs: 100`) | a form field named by its path, dots→dashes: **`train-epochs`**, default `100` |
-| a nested scalar (`train.loss.pose`) | same rule: **`train-loss-pose`** |
+| a nested scalar (`train.loss.weight`) | same rule: **`train-loss-weight`** |
 | a **boolean** (`train.amp: true`) | a plain form field (`true`/`false`) — no special treatment |
 | a **group directory** (`train/optimizer/*.yaml`) | ONE dropdown (**`train-optimizer`**) whose options are the file names; picking one swaps the whole subtree |
 | a **list** or other complex structure | NOT a form field — change it by swapping a group option or via the ADVANCED override |
 
 Some fields are dropdowns with a fixed set of valid values because the
-platform declares them (e.g. `data-source`: lakefs/s3,
-`quantization-mode`: none/ptq/qat) — submitting anything else fails the
-run immediately, with the allowed values listed in the error.
+platform declares them (e.g. `data-source`: lakefs/s3) — submitting
+anything else fails the run immediately, with the allowed values listed
+in the error.
 
 **The boolean non-rule:** booleans are just values now. Write
-`amp: true`, submit `false`, your step reads a real `False`. (If you
+`enabled: true`, submit `false`, your step reads a real `False`. (If you
 used the previous Typer-based version of this platform: the
 true/false-Enum workaround is gone.)
 
@@ -135,28 +134,29 @@ Push. The `train-optimizer` dropdown now offers `lion`.
 
 ## 4. Anatomy of pipeline.py (the whole file)
 
-`pipeline.py` declares structure and nothing else — this is the real,
-complete step list from this repo:
+`pipeline.py` declares structure and nothing else. This is the real,
+complete file from this repo — one example step:
 
 ```python
 from kubecore.authoring import pipeline, step  # platform-owned, do not edit
 
 with pipeline("ml-pipeline") as p:  # platform renames to {app}-pipeline at release
-    load = step("dataset-loading", reads=["data"],
-                outputs=["data-yaml", "manifest-summary"])
-    train = step("model-training", gpu=True, needs=[load],
-                 reads=["experiment", "data", "model", "train", "image_processing", "logging"],
-                 outputs=["training-result"])
-    qat = step("qat-finetune", gpu=True, needs=[train],
-               reads=["experiment", "train", "quantization"],
-               when="{{workflow.parameters.quantization-mode}} == qat",
-               outputs=["qat-result"])
-    quant = step("model-quantization", needs=[train, qat],
-                 reads=["experiment", "quantization"],
-                 when="{{workflow.parameters.quantization-mode}} != none",
-                 outputs=["quantization-result"])
-    register = step("model-registration", needs=[train, quant],
-                    reads=["data", "model", "registration"])
+    hello = step("hello-world", reads=["experiment"])
+```
+
+As your pipeline grows you add steps and wire them with `needs=`. An
+illustrative multi-step DAG using every argument:
+
+```python
+with pipeline("ml-pipeline") as p:  # platform renames to {app}-pipeline at release
+    prep = step("prepare", reads=["experiment", "data"],
+                outputs=["prepared-manifest"])
+    run = step("run", gpu=True, needs=[prep],
+               reads=["experiment", "train"],
+               when="{{workflow.parameters.train-enabled}} == true",
+               outputs=["run-result"])
+    report = step("report", needs=[prep, run],
+                  reads=["experiment"])
 ```
 
 Per step:
@@ -172,8 +172,8 @@ Per step:
 - **`outputs=[...]`** — small result files your step writes to
   `/work/output/<name>.json`.
 - **`when=...`** — conditional execution keyed on any form parameter
-  (parameter name = config path with dashes: `quantization.mode` →
-  `quantization-mode`).
+  (parameter name = config path with dashes: `train.enabled` →
+  `train-enabled`).
 
 ---
 
@@ -198,7 +198,7 @@ Three small edits — say we add `model-evaluation` after training:
 
 2. **code**: `mkdir steps/model_evaluation` with a Dockerfile and an
    entry point that reads its slice (this is the real pattern from
-   `steps/model_training/entry.py`):
+   `steps/hello_world/app/entry.py`):
 
    ```python
    import argparse
@@ -244,7 +244,7 @@ defaults:
 Everything inside the option file (`lr`, `momentum`, `weight_decay`, …)
 changes together — no field-by-field editing, no forgotten stragglers.
 Use groups for anything with internally-consistent presets: optimizers,
-augmentation recipes, callbacks, QAT settings.
+augmentation recipes, callbacks, export settings.
 
 **How a group interacts with its individual fields on the form:**
 fields you leave untouched follow the group you selected; fields you
@@ -269,7 +269,7 @@ exact section and step named (see §10) — nothing silently breaks.
 
 ## 8. GPU & resources
 
-- `step("model-training", gpu=True, ...)` is the entire GPU
+- `step("run", gpu=True, ...)` is the entire GPU
   configuration.
 - Per-run sizing is automatic: every step gets `{step}-cpu` and
   `{step}-mem` fields on the submit form (defaults = a whole node).
@@ -284,7 +284,7 @@ also offers the MeluXina classes — `meluxina-gpu` (4× A100-40GB), `meluxina-c
 (2× EPYC 7452, 128 cores, 512 GB), `meluxina-largemem` (4 TB). Pick one for a
 step and that step runs as a Slurm job on MeluXina; every other step keeps its
 in-cluster class. There is no global switch: placement is per step, per run
-(training on `meluxina-gpu`, quantization on `gpu-small`, registration
+(a GPU step on `meluxina-gpu`, a lighter step on `gpu-small`, another step
 in-cluster is a normal combination).
 
 What the platform does for an HPC-placed step: waits in the queue on your
@@ -297,8 +297,8 @@ public endpoints with a short-lived token minted per job.
 Give long steps a wall-clock limit (default 4 h):
 
 ```python
-train = step("model-training", gpu=True, needs=[load], hpc_time_limit="12h",
-             reads=["experiment", "data", "model", "train"])
+run = step("run", gpu=True, needs=[prep], hpc_time_limit="12h",
+           reads=["experiment", "train"])
 ```
 
 `hpc_time_limit` takes minutes or hours (`"90m"`, `"12h"`, `"720"`); Slurm kills
@@ -340,7 +340,7 @@ and no local submit. No cluster needed for the preview:
 ./run.sh                                  # or the commands below
 python pipeline.py                        # -> out/raw-workflow-template.yaml (your DAG)
 python -m kubecore.compose --output out/params.yaml         # composed defaults
-python -m kubecore.compose train.epochs=5 train/optimizer=adamw   # try overrides
+python -m kubecore.compose experiment.name=demo train/optimizer=adamw   # try overrides
 ```
 
 `out/params.yaml` is exactly what your steps will receive at run time. Errors you
@@ -350,7 +350,7 @@ can hit, verbatim:
 tree section) — fails at render, names both sides:
 
 ```
-platform.derive_tree.DeriveError: step 'model-registration' reads config section 'registration' which does not exist in the config tree (top-level sections: data, quantization, experiment, model, train, image_processing, registry, logging)
+platform.derive_tree.DeriveError: step 'report' reads config section 'reporting' which does not exist in the config tree (top-level sections: experiment, data, train)
 ```
 
 **Unknown/typo'd override key** — fails in the compose step, in
@@ -364,8 +364,8 @@ To append to your config use +train.epochz=5
 **Invalid value for a platform-declared dropdown**:
 
 ```
-compose-and-validate FAILED: Error merging override quantization.mode=banana
-  cause: Invalid value 'banana', expected one of [none, ptq, qat]
+compose-and-validate FAILED: Error merging override data.source=banana
+  cause: Invalid value 'banana', expected one of [lakefs, s3]
 ```
 
 **Unknown key inside the ADVANCED override YAML**:
@@ -385,28 +385,6 @@ the first step, pre-GPU.
 
 ---
 
-### 10.1 Seed a toy dataset (first run on an empty project)
-
-A new project's lakeFS repository is empty, so the first pipeline run stops at
-`config-validation` with `dataset path not found or empty`. Generate a small,
-valid pose dataset and sync it to the ref you train on (`data.ref`, default
-`main`):
-
-```bash
-python -m tools.toy_dataset --out ./toy-dataset                       # inspect locally
-LAKEFS_ENDPOINT=https://lakefs-<project>.<cluster-domain> \
-LAKEFS_ACCESS_KEY_ID=... LAKEFS_SECRET_ACCESS_KEY=... \
-python -m tools.toy_dataset --out ./toy-dataset --upload --repo <project> --branch main
-```
-
-It lands at `dataset/main/` — the platform standard `s3://{repo}/{ref}/dataset/{version}/`
-with `version` defaulting to the ref, which every template's `config-validation`
-and `dataset-loading` resolve — replaces any previous objects under that prefix,
-and makes one commit. 28 PNGs (train 16 / val 8 / test 4) of a filled
-ellipse with its 4 extreme points as keypoints — `kpt_shape: [4, 3]`, one
-class. Enough to run every step end to end (and to actually train with
-Ultralytics); swap in your real dataset with the same layout when you have it.
-
 ## 11. Using platform tools from step code
 
 Two ways in, both zero-config:
@@ -416,7 +394,7 @@ contains it (you don't declare or read= it, it's just there):
 
 ```python
 cfg = yaml.safe_load(args.params)
-bucket = cfg["platform"]["checkpoints"]["bucket"]     # "yolo"
+bucket = cfg["platform"]["checkpoints"]["bucket"]     # e.g. "my-project"
 prefix = cfg["platform"]["checkpoints"]["prefix"]     # "main/checkpoints"
 repo   = cfg["platform"]["lakefs"]["repository"]
 ```
@@ -435,7 +413,7 @@ MLflow just works:
 import mlflow
 mlflow.set_experiment(cfg["experiment"]["name"])
 with mlflow.start_run():
-    mlflow.log_metric("mAP50", 0.87)
+    mlflow.log_metric("accuracy", 0.87)
 ```
 
 lakeFS speaks the S3 API (repo = bucket, `ref/path` = key):
@@ -446,12 +424,13 @@ s3 = boto3.client("s3",
     endpoint_url=os.environ["LAKEFS_ENDPOINT"],
     aws_access_key_id=os.environ["LAKEFS_ACCESS_KEY"],
     aws_secret_access_key=os.environ["LAKEFS_SECRET_KEY"])
-s3.download_file("yolo", "main/data.yaml", "/work/data.yaml")
+s3.download_file("my-project", "main/dataset.yaml", "/work/dataset.yaml")
 ```
 
 When you run locally, the same `platform` section is filled from a
-local fallback file, so `python steps/model_training/entry.py --params
-"$(cat out/params.yaml)"` behaves like the real thing.
+local fallback file, so `python -m app.entry --params
+"$(cat out/params.yaml)"` (run from `steps/hello_world/`) behaves like
+the real thing.
 
 ---
 
@@ -460,15 +439,15 @@ local fallback file, so `python steps/model_training/entry.py --params
 Open the workflow template in the Argo UI, press **Submit**:
 
 - **`pipeline-info`** (first field) — read-only cheat-sheet; leave it.
-- **Group dropdowns** (`model`, `train-optimizer`, `train-callbacks`,
-  `train-qat`, `image_processing`) — swap whole presets. Fields you
+- **Group dropdowns** (any config group directory you define, e.g.
+  `train-optimizer`) — swap whole presets. Fields you
   leave untouched follow the group you pick; fields you explicitly
   change win over the group.
 - **Your scalar fields** — every leaf of your tree
-  (`train-epochs`, `data-ref`, `train-loss-pose`, …), plus dropdowns the
+  (`experiment-name`, `train-epochs`, `data-ref`, …), plus dropdowns the
   platform fills live (`data-ref` lists the datasets that actually
   exist; `cpu-class`/`gpu-class` list this cluster's node classes) and
-  fixed-choice fields it validates (`data-source`, `quantization-mode`).
+  fixed-choice fields it validates (e.g. `data-source`).
 - **Per-step sizing** — `{step}-cpu` / `{step}-mem`.
 - **`config` (ADVANCED)** — normally empty. When non-empty it is an
   override YAML merged LAST over everything above — for scripted
@@ -556,8 +535,8 @@ didn't change, you (or a script) explicitly set that field, and
 explicitly-set fields win over the group by design.
 
 **"My run failed with `Invalid value ... expected one of [...]`."**
-That field has a fixed set of valid values (e.g. `quantization-mode`:
-none/ptq/qat). Pick one of the listed values — the check exists to
+That field has a fixed set of valid values (e.g. `data-source`:
+lakefs/s3). Pick one of the listed values — the check exists to
 stop a typo from wasting a training run.
 
 **"My step needs a value from a section it doesn't read."**

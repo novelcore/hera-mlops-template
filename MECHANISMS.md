@@ -1,6 +1,6 @@
 # How it all works — the full mechanism
 
-The complete internal machinery of the Hera + Hydra ML pipeline platform: what
+The complete internal machinery of the Hera + Hydra pipeline platform: what
 happens when you add or remove a step, how enhancement transforms your DAG into a
 runnable WorkflowTemplate, how runtime config flows from your `config/` tree into
 a running container, and how every piece connects. `DEVELOPER.md` tells you *what
@@ -12,7 +12,7 @@ debugging it.
 ## 0. The three files that are the whole system
 
 ```
-pipeline.py   your DAG:   step("model-training", reads=[...], gpu=True, needs=[...])
+pipeline.py   your DAG:   step("run", reads=[...], gpu=True, needs=[...])
 config/       your knobs:  one Hydra tree — scalar leaf → form field, group dir → dropdown
 steps/<n>/    your code:   a Dockerfile + app/entry.py per step (name ↔ directory)
 ```
@@ -25,7 +25,7 @@ WorkflowTemplate, a Pod, a nodeSelector, or a secret.
 
 ## 1. The pipeline of pipelines (four transforms)
 
-Your three files become a running training job through four transforms, each in a
+Your three files become a running pipeline through four transforms, each in a
 different place and time:
 
 ```
@@ -53,7 +53,7 @@ different place and time:
 ```
 
 RENDER + ENHANCE run once per release (on push). SUBMIT + COMPOSE run once per
-training run. The render/enhance split is the security boundary: RENDER runs your
+run. The render/enhance split is the security boundary: RENDER runs your
 arbitrary `pipeline.py` with **no credentials**; ENHANCE runs only platform code.
 
 ---
@@ -78,7 +78,7 @@ pipeline(...)` block exits, `_build()` runs:
      hard error.
 2. **Run the `reads=` gate** (`derive_tree.validate_reads()`): every section a
    step declares in `reads=` must exist in the composed tree. For schema-backed
-   sections (`data`, `quantization`) it also requires a real on-disk source, so a
+   sections (e.g. `data`) it also requires a real on-disk source, so a
    renamed YAML key can't be silently backfilled by the ConfigStore schema.
 3. **Build the DAG** (plain Hera):
    - task 1 is always **`compose-and-validate`** — its args are ALL the override
@@ -192,7 +192,7 @@ You `mkdir steps/<name>` (+ Dockerfile + `app/entry.py`), add one
 config section. On push:
 1. **CI `detect-steps`** walks `steps/*/` and finds a directory with a Dockerfile
    that has no built image yet → it's in the build set (**step name ↔ directory**;
-   `dataset_loading/` → `dataset-loading`). It builds the image (kaniko → Zot).
+   `hello_world/` → `hello-world`). It builds the image (kaniko → Zot).
 2. **RENDER** adds the step to the DAG + wires its `needs=`/`reads=`/`when=`.
 3. **ENHANCE** gives it an `image-<name>` param, a `<name>-class` dropdown,
    `<name>-cpu/mem` sizing knobs, env/secrets, scheduling — everything.
@@ -221,8 +221,8 @@ cleanup and the reads= gate fails the release loudly, naming both sides.
   `ml-{project}` namespace get distinct WFTs — one app's render can never
   overwrite another's, even if both copied the same `pipeline("...")` literal.
 - **image ConfigMap is `{app}-pipeline-images`** — no cross-app image bleed.
-- **gitops discovery is slash-anchored** (`*/{app}/{branch}/…`) — `yolo` ≠
-  `yolo-training`.
+- **gitops discovery is slash-anchored** (`*/{app}/{branch}/…`) — `app` ≠
+  `app-training`.
 - **credential split** (§7): untrusted `pipeline.py` runs with no token and a
   locked-down executor SA (workflowtaskresults only) — it can't read another
   tenant's secrets via the K8s API.

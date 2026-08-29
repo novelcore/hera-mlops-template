@@ -3,9 +3,9 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "yolo-training-pipeline"
+name = "hera-pipeline-template"
 version = "0.1.0"
-description = "KubeCore ML pipeline (Hera DAG + Hydra experiment config)"
+description = "Hera pipeline template (Hera DAG + Hydra config)"
 requires-python = ">=3.11"
 # Render/compose-time dependencies. Pinned so the CI render is deterministic
 # (D4: determinism is a convention the lockfile enforces). The platform reads

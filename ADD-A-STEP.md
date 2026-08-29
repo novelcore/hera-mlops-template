@@ -67,7 +67,7 @@ import yaml
 # The config sections this step reads. List every top-level section you use.
 # The platform checks at render time that these sections exist — so a typo
 # here fails your PR early, not at 3am on a GPU node.
-READS = ["evaluation", "model"]
+READS = ["evaluation"]
 
 
 def main() -> None:
@@ -79,7 +79,6 @@ def main() -> None:
 
     # Your config is here. Read only what you declared in READS.
     evaluation = cfg["evaluation"]
-    model = cfg["model"]
 
     # Platform endpoints (if you need them) live under cfg["platform"]:
     #   cfg["platform"]["mlflow"]["tracking_uri"]
@@ -88,7 +87,7 @@ def main() -> None:
     # env vars (LAKEFS_ACCESS_KEY, LAKEFS_SECRET_KEY, MLFLOW_TRACKING_URI).
 
     print(f"[model-evaluation] split={evaluation['split']} "
-          f"iou={evaluation['iou_threshold']} model={model['variant']}")
+          f"iou={evaluation['iou_threshold']}")
 
     # ... do your real work here ...
 
@@ -161,7 +160,7 @@ defaults:
 ```
 
 If your step needs no new knobs, skip Step 4 entirely — just read existing
-sections (e.g. `READS = ["model", "data"]`).
+sections (e.g. `READS = ["experiment", "data"]`).
 
 ---
 
@@ -173,15 +172,14 @@ run first:
 
 ```python
 with pipeline("ml-pipeline") as p:
-    validate = step("config-validation", reads=["data", "model"])
-    load     = step("dataset-loading", reads=["data"], needs=[validate],
-                    outputs=["data-yaml", "manifest-summary"])
-    train    = step("model-training", gpu=True, needs=[load],
-                    reads=["experiment", "data", "model", "train"],
-                    outputs=["training-result"])
+    prep  = step("prepare", reads=["experiment", "data"],
+                 outputs=["prepared-manifest"])
+    train = step("run", gpu=True, needs=[prep],
+                 reads=["experiment", "train"],
+                 outputs=["training-result"])
     # 👇 YOUR NEW STEP — one line
-    evaluate = step("model-evaluation", reads=["evaluation", "model"], needs=[train])
-    register = step("model-registration", needs=[train], reads=["data", "model", "registration"])
+    evaluate = step("model-evaluation", reads=["evaluation"], needs=[train])
+    report = step("report", needs=[train], reads=["experiment"])
 ```
 
 **What each argument means:**
@@ -256,8 +254,8 @@ your step gets it as an input automatically.
 to `/work/output/<name>.json`:
 
 ```python
-# in the producing step (e.g. model-training in pipeline.py):
-train = step("model-training", ..., outputs=["training-result"])
+# in the producing step (e.g. run in pipeline.py):
+train = step("run", ..., outputs=["training-result"])
 ```
 
 ```python
@@ -265,7 +263,7 @@ train = step("model-training", ..., outputs=["training-result"])
 import json, os
 os.makedirs("/work/output", exist_ok=True)
 with open("/work/output/training-result.json", "w") as f:
-    json.dump({"best_map": 0.99, "weights_uri": "s3://..."}, f)
+    json.dump({"score": 0.99, "artifact_uri": "s3://..."}, f)
 ```
 
 **Consumer** (your step) just `needs=` the producer — the platform feeds every
@@ -279,11 +277,11 @@ evaluate = step("model-evaluation", reads=["evaluation"], needs=[train])
 # in your entry.py, read the input:
 parser.add_argument("--training-result", default="{}")
 args, _ = parser.parse_known_args()
-result = yaml.safe_load(args.training_result)   # {"best_map": 0.99, ...}
+result = yaml.safe_load(args.training_result)   # {"score": 0.99, ...}
 ```
 
 Keep these small (they pass as workflow parameters). For bulk data (datasets,
-weights), pass a pointer (an `s3://` URI) and stream it — don't inline it.
+model artifacts), pass a pointer (an `s3://` URI) and stream it — don't inline it.
 
 ---
 
