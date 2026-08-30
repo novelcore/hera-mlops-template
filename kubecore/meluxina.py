@@ -249,7 +249,7 @@ def tok():
     """The MeluXina JWT, read FRESH on every request. The platform mints it
     with a 60-minute lifetime and rotates the Secret every 25 minutes; the
     mounted file follows the rotation, an env var does not (live run
-    yolotrain-meluxina-toy-tvsm8: the pod's env token expired 13:30:02 while
+    app-meluxina-toy-abcde: the pod's env token expired 13:30:02 while
     the job still queued — every poll 502/511 for hours, and cancel/resubmit
     would have failed the same way)."""
     try:
@@ -586,10 +586,10 @@ def _cmd_json(cmd: list, routed=(), provider: str = "") -> str:
 
     References to a routed upstream's outputs are pair-aware (`_pair_expr`):
     a twin whose upstream ALSO ran on HPC must read the upstream twin, not
-    the Skipped in-cluster task (live wf 9xwb4 2026-08-28: qat-finetune on
+    the Skipped in-cluster task (observed at run time: a GPU step on
     MeluXina got --training-result "" and fine-tuned the base weights).
 
-    A naive json.dumps breaks at run time (live wf mgznz 2026-08-25): Argo
+    A naive json.dumps breaks at run time (observed at run time): Argo
     substitutes {{workflow.parameters.X}} / {{tasks.X.outputs.parameters.Y}}
     INSIDE the already-serialized string, and a multi-line value (the
     compose-and-validate params.yaml output is a whole YAML doc) lands raw
@@ -685,7 +685,7 @@ def _when_expr(when: str) -> str:
 
 
 def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None:
-    """Per-step HPC placement (PRD kubecore-operator#1191). Every step's
+    """Per-step HPC placement. Every step's
     {step}-class dropdown carries the HPC classes (enhance_class_param);
     here each un-pinned step gets a Slurm twin, and the pair is gated on
     the chosen class: in-cluster when the class is not HPC, twin when it is.
@@ -784,11 +784,11 @@ def enhance_hpc(spec: dict, ctx: dict, steps: list, gpu_step_names: set) -> None
     # is now a twin pair where exactly one twin runs and the other is Skipped.
     # Twins included: a twin whose upstream also ran on HPC must depend on
     # the upstream PAIR, not on the (Skipped) in-cluster task.
-    # Status-qualified references (qat-finetune.Succeeded || qat-finetune.Skipped
-    # || qat-finetune.Omitted) must name the twin too: Argo exposes tasks.X to
+    # Status-qualified references (step.Succeeded || step.Skipped
+    # || step.Omitted) must name the twin too: Argo exposes tasks.X to
     # a task's expressions ONLY for X in its depends, so a consumer whose
     # args pick tasks['X-meluxina'] hangs forever with "tasks.X-meluxina is
-    # missing" (live wf b6qlj/f9kr8 2026-08-28, argo v4.0.6). Pair semantics:
+    # missing" (observed at run time, argo v4.0.6). Pair semantics:
     # Succeeded/Failed/Errored/Daemoned = either twin; Skipped/Omitted = both.
     def _status_pair(r):
         def sub(m):
