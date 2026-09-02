@@ -1,0 +1,99 @@
+site_name: Hera Pipeline Guide
+site_description: A friendly, step by step guide to building your own Hera pipeline from this template
+site_author: Novelcore
+site_url: https://novelcore.github.io/hera-pipeline-template/
+
+repo_name: novelcore/hera-pipeline-template
+repo_url: https://github.com/novelcore/hera-pipeline-template
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+theme:
+  name: material
+  language: en
+  logo: assets/logo.png
+  favicon: assets/favicon.svg
+  palette:
+    - scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+extra_css:
+  - assets/extra.css
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/novelcore/hera-pipeline-template
+
+nav:
+  - Home: index.md
+  - Getting ready:
+      - What you need: what-you-need.md
+      - Get the project: get-the-project.md
+      - How it works: how-it-works.md
+  - Build your pipeline:
+      - Add a step: add-a-step.md
+      - Remove a step: remove-a-step.md
+      - Change a setting: change-a-setting.md
+  - Ship it:
+      - Send your change in: send-it-in.md
+      - Go live: go-live.md
+      - Run your pipeline: run-it.md
+  - Help:
+      - When something breaks: troubleshooting.md
+      - Word list: glossary.md
+
+copyright: "Copyright &copy; 2026 Novelcore"
