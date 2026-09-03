@@ -99,3 +99,8 @@ and brings the step's declared outputs back so the next step consumes them as us
 - Give long steps a wall-clock limit in `pipeline.py`: `step(..., hpc_time_limit="12h")`
   (default 4 h). See [DEVELOPER.md §8.1](DEVELOPER.md).
 - Steps pinned with a `compute-class` annotation stay in-cluster.
+
+## License
+
+This project is licensed under the Apache License, Version 2.0. See the
+[LICENSE](LICENSE) file for the full terms.
